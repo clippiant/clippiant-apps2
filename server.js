@@ -76,17 +76,27 @@ app.post("/render", async (req, res) => {
       const segPath = path.join(tmpDir, `seg-${i}.mp4`);
       segmentPaths.push(segPath);
 
-      const text = sceneTexts[i].replace(/:/g, "\\:").replace(/'/g, "\\'"); // escape for drawtext
-      const args = [
-        "-y",
-        "-f", "lavfi",
-        "-i", "color=c=#0b0b0b:s=1280x720:d=3",
-        "-vf",
-        `drawtext=fontcolor=white:fontsize=42:x=(w-text_w)/2:y=(h-text_h)/2:text='${text}'`,
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        segPath
-      ];
+const fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+const text = String(sceneTexts[i])
+  .replace(/\\/g, "\\\\")
+  .replace(/:/g, "\\:")
+  .replace(/'/g, "\\\\'")
+  .replace(/\[/g, "\\[")
+  .replace(/\]/g, "\\]")
+  .replace(/,/g, "\\,")
+  .replace(/\n/g, " ");
+
+const args = [
+  "-y",
+  "-f", "lavfi",
+  "-i", "color=c=#0b0b0b:s=1280x720:d=3",
+  "-vf",
+  `drawtext=fontfile=${fontPath}:fontcolor=white:fontsize=42:x=(w-text_w)/2:y=(h-text_h)/2:text='${text}'`,
+  "-c:v", "libx264",
+  "-pix_fmt", "yuv420p",
+  segPath
+];
 
       await runFfmpeg(args);
       await supabase.from("exports").update({ progress: Math.min(15 + Math.floor(((i + 1) / sceneTexts.length) * 55), 70) }).eq("id", exportId);
@@ -133,10 +143,25 @@ app.post("/render", async (req, res) => {
 
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
-    const p = spawn("ffmpeg", args, { stdio: "ignore" });
+    const p = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let stdout = "";
+    let stderr = "";
+
+    p.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    p.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
     p.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited with code ${code}`));
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(`ffmpeg exited with code ${code}\nSTDERR:\n${stderr}`));
+      }
     });
   });
 }
