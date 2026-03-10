@@ -80,7 +80,6 @@ app.post("/render", async (req, res) => {
 
   console.log("Received render request for exportId:", exportId);
 
-  // respond immediately so caller isn't waiting on render
   res.json({ ok: true });
 
   let tmpDir = null;
@@ -124,13 +123,13 @@ app.post("/render", async (req, res) => {
     const narration = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: "alloy",
-      input: project.script || project.title || "Clippiant video"
+      input: project.script || project.title || "Clippiant video",
     });
 
     const audioBuffer = Buffer.from(await narration.arrayBuffer());
     fs.writeFileSync(narrationPath, audioBuffer);
 
-    await supabase.from("exports").update({ progress: 25 }).eq("id", exportId);
+    await supabase.from("exports").update({ progress: 20 }).eq("id", exportId);
 
     const scenes = Array.isArray(project.scenes) ? project.scenes : [];
     const sceneTexts = scenes.length
@@ -140,14 +139,46 @@ app.post("/render", async (req, res) => {
         })
       : [project.script || project.title || "Clippiant video"];
 
+    console.log("Generating AI images for scenes");
+
+    const imagePaths = [];
+
+    for (let i = 0; i < sceneTexts.length; i++) {
+      const imagePath = path.join(tmpDir, `scene-${i}.png`);
+      imagePaths.push(imagePath);
+
+      const prompt = scenes[i]?.visual || sceneTexts[i];
+
+      const imageResult = await openai.images.generate({
+        model: "gpt-image-1",
+        prompt: `Create a cinematic, high-quality visual for this video scene: ${prompt}`,
+        size: "1536x1024",
+      });
+
+      const imageBase64 = imageResult.data?.[0]?.b64_json;
+      if (!imageBase64) {
+        throw new Error(`Image generation failed for scene ${i + 1}`);
+      }
+
+      fs.writeFileSync(imagePath, Buffer.from(imageBase64, "base64"));
+
+      const progress = Math.min(
+        20 + Math.floor(((i + 1) / sceneTexts.length) * 20),
+        40
+      );
+      await supabase.from("exports").update({ progress }).eq("id", exportId);
+    }
+
+    console.log("Rendering scene video segments from AI images");
+
     const segmentPaths = [];
     const fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
 
-    for (let i = 0; i < sceneTexts.length; i++) {
+    for (let i = 0; i < imagePaths.length; i++) {
       const segPath = path.join(tmpDir, `seg-${i}.mp4`);
       segmentPaths.push(segPath);
 
-      const text = String(sceneTexts[i])
+      const overlayText = String(sceneTexts[i])
         .replace(/\\/g, "\\\\")
         .replace(/:/g, "\\:")
         .replace(/'/g, "\\\\'")
@@ -156,20 +187,23 @@ app.post("/render", async (req, res) => {
         .replace(/,/g, "\\,")
         .replace(/\n/g, " ");
 
-      const args = [
+      await runFfmpeg([
         "-y",
-        "-f", "lavfi",
-        "-i", "color=c=#0b0b0b:s=1280x720:d=3",
+        "-loop", "1",
+        "-i", imagePaths[i],
         "-vf",
-        `drawtext=fontfile=${fontPath}:fontcolor=white:fontsize=42:x=(w-text_w)/2:y=(h-text_h)/2:text='${text}'`,
+        `scale=1280:720,zoompan=z='min(zoom+0.0008,1.08)':d=90:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',drawtext=fontfile=${fontPath}:fontcolor=white:fontsize=32:box=1:boxcolor=black@0.45:boxborderw=12:x=(w-text_w)/2:y=h-(text_h*2):text='${overlayText}'`,
+        "-t", "3",
+        "-r", "30",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        segPath
-      ];
+        segPath,
+      ]);
 
-      await runFfmpeg(args);
-
-      const progress = Math.min(25 + Math.floor(((i + 1) / sceneTexts.length) * 40), 65);
+      const progress = Math.min(
+        40 + Math.floor(((i + 1) / imagePaths.length) * 25),
+        65
+      );
       await supabase.from("exports").update({ progress }).eq("id", exportId);
     }
 
@@ -187,7 +221,7 @@ app.post("/render", async (req, res) => {
       "-safe", "0",
       "-i", listPath,
       "-c", "copy",
-      slideshowPath
+      slideshowPath,
     ]);
 
     await supabase.from("exports").update({ progress: 75 }).eq("id", exportId);
@@ -201,7 +235,7 @@ app.post("/render", async (req, res) => {
       "-c:v", "copy",
       "-c:a", "aac",
       "-shortest",
-      finalVideoPath
+      finalVideoPath,
     ]);
 
     await supabase.from("exports").update({ progress: 90 }).eq("id", exportId);
@@ -213,7 +247,7 @@ app.post("/render", async (req, res) => {
       .from("exports")
       .upload(storagePath, fileBytes, {
         contentType: "video/mp4",
-        upsert: true
+        upsert: true,
       });
 
     if (uploadError) {
@@ -229,7 +263,7 @@ app.post("/render", async (req, res) => {
       .update({
         status: "done",
         progress: 100,
-        video_url: publicUrlData.publicUrl
+        video_url: publicUrlData.publicUrl,
       })
       .eq("id", exportId);
 
@@ -242,7 +276,7 @@ app.post("/render", async (req, res) => {
       .from("exports")
       .update({
         status: "failed",
-        error: message
+        error: message,
       })
       .eq("id", exportId);
   } finally {
