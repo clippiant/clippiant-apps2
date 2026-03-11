@@ -14,6 +14,14 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+// Optional polish features
+const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
+const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
+const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.5");
+const SUBTITLE_FONT_PATH =
+  process.env.SUBTITLE_FONT_PATH ||
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
@@ -41,9 +49,9 @@ function requireSecret(req, res) {
   return false;
 }
 
-function runFfmpeg(args) {
+function runProcess(command, args) {
   return new Promise((resolve, reject) => {
-    const p = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
 
     let stdout = "";
     let stderr = "";
@@ -60,10 +68,35 @@ function runFfmpeg(args) {
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
-        reject(new Error(`ffmpeg exited with code ${code}\nSTDERR:\n${stderr}`));
+        reject(
+          new Error(`${command} exited with code ${code}\nSTDERR:\n${stderr}`)
+        );
       }
     });
   });
+}
+
+function runFfmpeg(args) {
+  return runProcess("ffmpeg", args);
+}
+
+async function getMediaDuration(filePath) {
+  const { stdout } = await runProcess("ffprobe", [
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    filePath,
+  ]);
+
+  const value = Number(String(stdout).trim());
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`Unable to read media duration for ${filePath}`);
+  }
+
+  return value;
 }
 
 async function updateExport(exportId, values) {
@@ -76,6 +109,38 @@ async function updateExport(exportId, values) {
 function toPositiveInt(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function sanitizeFilenamePart(value) {
+  return String(value || "")
+    .replace(/[^\w\-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 40);
+}
+
+function escapeDrawtext(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\\\'")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/\n/g, " ");
+}
+
+function srtTimestamp(seconds) {
+  const totalMs = Math.max(0, Math.floor(seconds * 1000));
+  const hours = Math.floor(totalMs / 3600000);
+  const minutes = Math.floor((totalMs % 3600000) / 60000);
+  const secs = Math.floor((totalMs % 60000) / 1000);
+  const ms = totalMs % 1000;
+
+  return [
+    String(hours).padStart(2, "0"),
+    String(minutes).padStart(2, "0"),
+    String(secs).padStart(2, "0"),
+  ].join(":") + `,${String(ms).padStart(3, "0")}`;
 }
 
 function normalizeScenes(project) {
@@ -115,8 +180,8 @@ function normalizeScenes(project) {
           frameIndex === 0
             ? "Initial moment of the scene."
             : frameIndex === fallbackFrameCount - 1
-              ? "Final moment of the scene with subtle progression."
-              : `A subtle continuation of the same scene, frame ${frameIndex + 1}.`,
+            ? "Final moment of the scene with subtle progression."
+            : `A subtle continuation of the same scene, frame ${frameIndex + 1}.`,
       }));
     }
 
@@ -202,12 +267,12 @@ function getTotalFrames(scenes) {
 
 function computeImageProgress(completedFrames, totalFrames) {
   if (!totalFrames) return 20;
-  return Math.min(20 + Math.floor((completedFrames / totalFrames) * 30), 50);
+  return Math.min(20 + Math.floor((completedFrames / totalFrames) * 20), 40);
 }
 
 function computeSceneRenderProgress(completedScenes, totalScenes) {
-  if (!totalScenes) return 50;
-  return Math.min(50 + Math.floor((completedScenes / totalScenes) * 20), 70);
+  if (!totalScenes) return 40;
+  return Math.min(40 + Math.floor((completedScenes / totalScenes) * 20), 60);
 }
 
 async function generateImageFromPrompt(prompt) {
@@ -225,7 +290,11 @@ async function generateImageFromPrompt(prompt) {
   return Buffer.from(imageBase64, "base64");
 }
 
-async function editImageWithReference({ referencePath, prompt, size = "1536x1024" }) {
+async function editImageWithReference({
+  referencePath,
+  prompt,
+  size = "1536x1024",
+}) {
   const form = new FormData();
   form.append("model", "gpt-image-1");
   form.append("prompt", prompt);
@@ -233,8 +302,6 @@ async function editImageWithReference({ referencePath, prompt, size = "1536x1024
 
   const referenceBytes = fs.readFileSync(referencePath);
   const referenceBlob = new Blob([referenceBytes], { type: "image/png" });
-
-  // Official Images edit endpoint
   form.append("image[]", referenceBlob, "reference.png");
 
   const response = await fetch("https://api.openai.com/v1/images/edits", {
@@ -260,6 +327,194 @@ async function editImageWithReference({ referencePath, prompt, size = "1536x1024
   return Buffer.from(imageBase64, "base64");
 }
 
+function writeSceneSubtitles(srtPath, scenes, transitionDuration) {
+  let cursor = 0;
+  const blocks = [];
+
+  for (let i = 0; i < scenes.length; i++) {
+    const scene = scenes[i];
+    const subtitleText = String(scene?.narration || "").trim();
+    if (!subtitleText) {
+      cursor += Number(scene.duration_seconds || 0);
+      continue;
+    }
+
+    const start = cursor;
+    const end = cursor + Number(scene.duration_seconds || 0);
+
+    blocks.push(
+      `${blocks.length + 1}`,
+      `${srtTimestamp(start)} --> ${srtTimestamp(Math.max(start + 0.6, end - transitionDuration * 0.25))}`,
+      subtitleText,
+      ""
+    );
+
+    cursor = end;
+    if (i < scenes.length - 1) {
+      cursor -= transitionDuration;
+    }
+  }
+
+  fs.writeFileSync(srtPath, blocks.join("\n"), "utf8");
+}
+
+async function applySubtitles(inputPath, outputPath, srtPath) {
+  const subtitlePathForFfmpeg = srtPath
+    .replace(/\\/g, "/")
+    .replace(/:/g, "\\:");
+
+  await runFfmpeg([
+    "-y",
+    "-i",
+    inputPath,
+    "-vf",
+    `subtitles='${subtitlePathForFfmpeg}':force_style='FontName=DejaVu Sans,FontSize=20,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=1,Shadow=0,MarginV=28'`,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-an",
+    outputPath,
+  ]);
+}
+
+async function renderSceneClipFromFrames({
+  sceneDir,
+  outputPath,
+  fps,
+  durationSeconds,
+}) {
+  const subtleMotionFilter =
+    "scale=1408:792,crop=1280:720:x='(in_w-out_w)/2 + 10*sin(t*0.4)':y='(in_h-out_h)/2 + 6*cos(t*0.3)',format=yuv420p";
+
+  await runFfmpeg([
+    "-y",
+    "-framerate",
+    String(fps),
+    "-i",
+    path.join(sceneDir, "frame_%04d.png"),
+    "-vf",
+    subtleMotionFilter,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-r",
+    "30",
+    "-t",
+    String(durationSeconds),
+    outputPath,
+  ]);
+}
+
+async function mergeSceneClipsWithTransitions(sceneClipPaths, outputPath, transitionDuration) {
+  if (sceneClipPaths.length === 1) {
+    fs.copyFileSync(sceneClipPaths[0], outputPath);
+    return;
+  }
+
+  const durations = [];
+  for (const clip of sceneClipPaths) {
+    durations.push(await getMediaDuration(clip));
+  }
+
+  const args = ["-y"];
+
+  for (const clip of sceneClipPaths) {
+    args.push("-i", clip);
+  }
+
+  let filter = "";
+  for (let i = 0; i < sceneClipPaths.length; i++) {
+    filter += `[${i}:v]format=yuv420p,setpts=PTS-STARTPTS[v${i}];`;
+  }
+
+  let cumulativeOffset = durations[0] - transitionDuration;
+  let currentLabel = "[v0]";
+
+  for (let i = 1; i < sceneClipPaths.length; i++) {
+    const nextLabel = `[v${i}]`;
+    const outLabel = i === sceneClipPaths.length - 1 ? "[vout]" : `[vx${i}]`;
+
+    filter += `${currentLabel}${nextLabel}xfade=transition=fade:duration=${transitionDuration}:offset=${cumulativeOffset}${outLabel};`;
+
+    currentLabel = outLabel;
+    cumulativeOffset += durations[i] - transitionDuration;
+  }
+
+  args.push(
+    "-filter_complex",
+    filter,
+    "-map",
+    currentLabel === "[vout]" ? "[vout]" : currentLabel,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    outputPath
+  );
+
+  await runFfmpeg(args);
+}
+
+async function mergeVideoWithNarrationAndMusic({
+  videoPath,
+  narrationPath,
+  outputPath,
+  backgroundMusicPath,
+  bgmVolume,
+}) {
+  const hasMusic =
+    backgroundMusicPath &&
+    fs.existsSync(backgroundMusicPath) &&
+    fs.statSync(backgroundMusicPath).isFile();
+
+  if (!hasMusic) {
+    await runFfmpeg([
+      "-y",
+      "-i",
+      videoPath,
+      "-i",
+      narrationPath,
+      "-map",
+      "0:v:0",
+      "-map",
+      "1:a:0",
+      "-c:v",
+      "copy",
+      "-c:a",
+      "aac",
+      "-shortest",
+      outputPath,
+    ]);
+    return;
+  }
+
+  await runFfmpeg([
+    "-y",
+    "-i",
+    videoPath,
+    "-i",
+    narrationPath,
+    "-stream_loop",
+    "-1",
+    "-i",
+    backgroundMusicPath,
+    "-filter_complex",
+    `[1:a]volume=1.0[narr];[2:a]volume=${bgmVolume}[bgm];[narr][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
+    "-map",
+    "0:v:0",
+    "-map",
+    "[aout]",
+    "-c:v",
+    "copy",
+    "-c:a",
+    "aac",
+    "-shortest",
+    outputPath,
+  ]);
+}
+
 app.get("/", (_req, res) => {
   res.send("clippiant-worker ok");
 });
@@ -274,7 +529,6 @@ app.post("/render", async (req, res) => {
 
   console.log("Received render request for exportId:", exportId);
 
-  // Return immediately so the app doesn't wait on render completion.
   res.json({ ok: true });
 
   let tmpDir = null;
@@ -310,13 +564,18 @@ app.post("/render", async (req, res) => {
     const scenes = normalizeScenes(project);
     const narrationText = getNarrationText(project, scenes);
 
-    await updateExport(exportId, { progress: 10 });
+    await updateExport(exportId, {
+      progress: 10,
+      stage: "generating_narration",
+    });
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clippiant-"));
 
     const narrationPath = path.join(tmpDir, "narration.mp3");
-    const combinedScenesPath = path.join(tmpDir, "combined-scenes.mp4");
+    const transitionedVideoPath = path.join(tmpDir, "video-transitioned.mp4");
+    const subtitledVideoPath = path.join(tmpDir, "video-subtitled.mp4");
     const finalVideoPath = path.join(tmpDir, `${exportId}.mp4`);
+    const subtitlesPath = path.join(tmpDir, "subtitles.srt");
 
     console.log("Generating narration audio");
 
@@ -329,7 +588,10 @@ app.post("/render", async (req, res) => {
     const audioBuffer = Buffer.from(await narration.arrayBuffer());
     fs.writeFileSync(narrationPath, audioBuffer);
 
-    await updateExport(exportId, { progress: 20 });
+    await updateExport(exportId, {
+      progress: 20,
+      stage: "generating_frames",
+    });
 
     console.log("Generating AI frame sequences for scenes");
 
@@ -339,7 +601,10 @@ app.post("/render", async (req, res) => {
 
     for (let sceneIndex = 0; sceneIndex < scenes.length; sceneIndex++) {
       const scene = scenes[sceneIndex];
-      const sceneDir = path.join(tmpDir, `scene-${sceneIndex + 1}`);
+      const sceneDir = path.join(
+        tmpDir,
+        `scene-${String(sceneIndex + 1).padStart(2, "0")}-${sanitizeFilenamePart(scene.title)}`
+      );
       fs.mkdirSync(sceneDir, { recursive: true });
 
       let referenceFramePath = null;
@@ -362,7 +627,6 @@ app.post("/render", async (req, res) => {
         if (isFirstFrame) {
           const prompt = buildFramePrompt(scene, frame, false);
           console.log("Using base generation for first frame");
-          console.log("Prompt used:", prompt);
           imageBuffer = await generateImageFromPrompt(prompt);
           fs.writeFileSync(framePath, imageBuffer);
           referenceFramePath = framePath;
@@ -370,7 +634,6 @@ app.post("/render", async (req, res) => {
           const prompt = buildFramePrompt(scene, frame, true);
           console.log("Using reference-based edit for subsequent frame");
           console.log("Reference frame used:", referenceFramePath);
-          console.log("Prompt used:", prompt);
           imageBuffer = await editImageWithReference({
             referencePath: referenceFramePath,
             prompt,
@@ -384,12 +647,16 @@ app.post("/render", async (req, res) => {
         completedFrames += 1;
         await updateExport(exportId, {
           progress: computeImageProgress(completedFrames, totalFrames),
+          stage: "generating_frames",
         });
       }
 
       console.log(`Rendering stop-motion clip for scene ${sceneIndex + 1}`);
 
-      const sceneClipPath = path.join(tmpDir, `scene-${sceneIndex + 1}.mp4`);
+      const sceneClipPath = path.join(
+        tmpDir,
+        `scene-clip-${String(sceneIndex + 1).padStart(2, "0")}.mp4`
+      );
       sceneClipPaths.push(sceneClipPath);
 
       const fps = Math.max(
@@ -397,68 +664,60 @@ app.post("/render", async (req, res) => {
         scene.frames.length / Math.max(1, scene.duration_seconds)
       );
 
-      await runFfmpeg([
-        "-y",
-        "-framerate",
-        String(fps),
-        "-i",
-        path.join(sceneDir, "frame_%04d.png"),
-        "-vf",
-        "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuv420p",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-r",
-        "30",
-        sceneClipPath,
-      ]);
+      await renderSceneClipFromFrames({
+        sceneDir,
+        outputPath: sceneClipPath,
+        fps,
+        durationSeconds: scene.duration_seconds,
+      });
 
       await updateExport(exportId, {
         progress: computeSceneRenderProgress(sceneIndex + 1, scenes.length),
+        stage: "rendering_scene_clips",
       });
     }
 
-    console.log("Concatenating scene clips");
+    await updateExport(exportId, {
+      progress: 65,
+      stage: "merging_video",
+    });
 
-    const listPath = path.join(tmpDir, "list.txt");
-    fs.writeFileSync(
-      listPath,
-      sceneClipPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n")
+    console.log("Merging scene clips with transitions");
+    await mergeSceneClipsWithTransitions(
+      sceneClipPaths,
+      transitionedVideoPath,
+      TRANSITION_DURATION
     );
 
-    await runFfmpeg([
-      "-y",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      listPath,
-      "-c",
-      "copy",
-      combinedScenesPath,
-    ]);
+    await updateExport(exportId, {
+      progress: 72,
+      stage: "adding_subtitles",
+    });
 
-    await updateExport(exportId, { progress: 75 });
+    console.log("Writing subtitles");
+    writeSceneSubtitles(subtitlesPath, scenes, TRANSITION_DURATION);
 
-    console.log("Merging narration with final video");
+    console.log("Burning subtitles into video");
+    await applySubtitles(transitionedVideoPath, subtitledVideoPath, subtitlesPath);
 
-    await runFfmpeg([
-      "-y",
-      "-i",
-      combinedScenesPath,
-      "-i",
+    await updateExport(exportId, {
+      progress: 82,
+      stage: "adding_audio",
+    });
+
+    console.log("Merging narration and background music");
+    await mergeVideoWithNarrationAndMusic({
+      videoPath: subtitledVideoPath,
       narrationPath,
-      "-c:v",
-      "copy",
-      "-c:a",
-      "aac",
-      "-shortest",
-      finalVideoPath,
-    ]);
+      outputPath: finalVideoPath,
+      backgroundMusicPath: BACKGROUND_MUSIC_PATH,
+      bgmVolume: BGM_VOLUME,
+    });
 
-    await updateExport(exportId, { progress: 90 });
+    await updateExport(exportId, {
+      progress: 92,
+      stage: "uploading",
+    });
 
     console.log("Uploading final video");
 
@@ -483,18 +742,26 @@ app.post("/render", async (req, res) => {
     await updateExport(exportId, {
       status: "done",
       progress: 100,
+      stage: "done",
       video_url: publicUrlData?.publicUrl || null,
       error: null,
     });
 
     console.log("Render completed:", exportId);
   } catch (e) {
-    const message = e?.message || String(e);
+    let message = e?.message || String(e);
+
+    if (message.includes("Billing hard limit has been reached")) {
+      message =
+        "OpenAI billing limit reached. Increase your API billing limit or use a funded API key.";
+    }
+
     console.error("Render failed:", message);
 
     await updateExport(exportId, {
       status: "failed",
       error: message,
+      stage: "failed",
     });
   } finally {
     if (tmpDir) {
