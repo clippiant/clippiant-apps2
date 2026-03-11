@@ -104,19 +104,19 @@ function normalizeScenes(project) {
 
   return rawScenes.map((scene, sceneIndex) => {
     const durationSeconds = toPositiveInt(scene?.duration_seconds, 4);
-    const frameCount = toPositiveInt(scene?.frame_count, 4);
+    const fallbackFrameCount = toPositiveInt(scene?.frame_count, 4);
 
     let frames = Array.isArray(scene?.frames) ? scene.frames : [];
 
     if (!frames.length) {
-      frames = Array.from({ length: frameCount }).map((_, frameIndex) => ({
+      frames = Array.from({ length: fallbackFrameCount }).map((_, frameIndex) => ({
         frame_index: frameIndex,
         delta_prompt:
           frameIndex === 0
             ? "Initial moment of the scene."
-            : frameIndex === frameCount - 1
-            ? "Final moment of the scene with subtle progression."
-            : `A subtle continuation of the same scene, frame ${frameIndex + 1}.`,
+            : frameIndex === fallbackFrameCount - 1
+              ? "Final moment of the scene with subtle progression."
+              : `A subtle continuation of the same scene, frame ${frameIndex + 1}.`,
       }));
     }
 
@@ -142,16 +142,19 @@ function normalizeScenes(project) {
         scene?.continuity_rules ||
         "Keep the same subject identity, same environment layout, same camera angle, same lighting, same color palette, and same style across every frame. Do not make this look like a comic panel, storyboard, or separate illustration.",
       duration_seconds: durationSeconds,
-      frame_count: frames.length || frameCount,
+      frame_count: frames.length,
       frames,
     };
   });
 }
 
-function buildFramePrompt(scene, frame) {
+function buildFramePrompt(scene, frame, isReferenceBased = false) {
   return [
     "Create a single frame from a cinematic AI video sequence.",
     "This frame must visually complement the other frames in the same scene.",
+    isReferenceBased
+      ? "Use the provided reference image to preserve the same subject identity, environment, framing, lighting, and overall composition."
+      : "Establish the visual identity of the scene clearly and consistently.",
     "Do not create a comic panel, storyboard frame, split panel, or separate illustration.",
     "Maintain temporal continuity and near-identical scene identity across frames.",
     "",
@@ -171,15 +174,20 @@ function buildFramePrompt(scene, frame) {
     "- no storyboard look",
     "- no caption boxes",
     "- no split panels",
+    isReferenceBased
+      ? "- preserve the visual identity of the reference image while making only the requested subtle motion change"
+      : "- establish a strong, stable visual identity that later frames can follow",
   ].join("\n");
 }
 
 function getNarrationText(project, scenes) {
   if (Array.isArray(scenes) && scenes.length) {
-    return scenes
+    const joined = scenes
       .map((scene) => scene?.narration)
       .filter(Boolean)
       .join(" ");
+
+    if (joined.trim()) return joined;
   }
 
   return project?.script || project?.title || "Clippiant video";
@@ -202,6 +210,56 @@ function computeSceneRenderProgress(completedScenes, totalScenes) {
   return Math.min(50 + Math.floor((completedScenes / totalScenes) * 20), 70);
 }
 
+async function generateImageFromPrompt(prompt) {
+  const imageResult = await openai.images.generate({
+    model: "gpt-image-1",
+    prompt,
+    size: "1536x1024",
+  });
+
+  const imageBase64 = imageResult.data?.[0]?.b64_json;
+  if (!imageBase64) {
+    throw new Error("Image generation failed: no b64_json returned");
+  }
+
+  return Buffer.from(imageBase64, "base64");
+}
+
+async function editImageWithReference({ referencePath, prompt, size = "1536x1024" }) {
+  const form = new FormData();
+  form.append("model", "gpt-image-1");
+  form.append("prompt", prompt);
+  form.append("size", size);
+
+  const referenceBytes = fs.readFileSync(referencePath);
+  const referenceBlob = new Blob([referenceBytes], { type: "image/png" });
+
+  // Official Images edit endpoint
+  form.append("image[]", referenceBlob, "reference.png");
+
+  const response = await fetch("https://api.openai.com/v1/images/edits", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: form,
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Image edit failed: ${response.status} ${text}`);
+  }
+
+  const json = await response.json();
+  const imageBase64 = json?.data?.[0]?.b64_json;
+
+  if (!imageBase64) {
+    throw new Error("Image edit failed: no b64_json returned");
+  }
+
+  return Buffer.from(imageBase64, "base64");
+}
+
 app.get("/", (_req, res) => {
   res.send("clippiant-worker ok");
 });
@@ -216,7 +274,7 @@ app.post("/render", async (req, res) => {
 
   console.log("Received render request for exportId:", exportId);
 
-  // Respond immediately so the caller does not wait for render completion.
+  // Return immediately so the app doesn't wait on render completion.
   res.json({ ok: true });
 
   let tmpDir = null;
@@ -257,7 +315,7 @@ app.post("/render", async (req, res) => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clippiant-"));
 
     const narrationPath = path.join(tmpDir, "narration.mp3");
-    const slideshowPath = path.join(tmpDir, "combined-scenes.mp4");
+    const combinedScenesPath = path.join(tmpDir, "combined-scenes.mp4");
     const finalVideoPath = path.join(tmpDir, `${exportId}.mp4`);
 
     console.log("Generating narration audio");
@@ -284,6 +342,8 @@ app.post("/render", async (req, res) => {
       const sceneDir = path.join(tmpDir, `scene-${sceneIndex + 1}`);
       fs.mkdirSync(sceneDir, { recursive: true });
 
+      let referenceFramePath = null;
+
       for (let frameIndex = 0; frameIndex < scene.frames.length; frameIndex++) {
         const frame = scene.frames[frameIndex];
         const framePath = path.join(
@@ -291,26 +351,35 @@ app.post("/render", async (req, res) => {
           `frame_${String(frameIndex + 1).padStart(4, "0")}.png`
         );
 
-        const prompt = buildFramePrompt(scene, frame);
+        const isFirstFrame = frameIndex === 0;
 
         console.log(
           `Generating image for scene ${sceneIndex + 1}/${scenes.length}, frame ${frameIndex + 1}/${scene.frames.length}`
         );
 
-        const imageResult = await openai.images.generate({
-          model: "gpt-image-1",
-          prompt,
-          size: "1536x1024",
-        });
+        let imageBuffer;
 
-        const imageBase64 = imageResult.data?.[0]?.b64_json;
-        if (!imageBase64) {
-          throw new Error(
-            `Image generation failed for scene ${sceneIndex + 1}, frame ${frameIndex + 1}`
-          );
+        if (isFirstFrame) {
+          const prompt = buildFramePrompt(scene, frame, false);
+          console.log("Using base generation for first frame");
+          console.log("Prompt used:", prompt);
+          imageBuffer = await generateImageFromPrompt(prompt);
+          fs.writeFileSync(framePath, imageBuffer);
+          referenceFramePath = framePath;
+        } else {
+          const prompt = buildFramePrompt(scene, frame, true);
+          console.log("Using reference-based edit for subsequent frame");
+          console.log("Reference frame used:", referenceFramePath);
+          console.log("Prompt used:", prompt);
+          imageBuffer = await editImageWithReference({
+            referencePath: referenceFramePath,
+            prompt,
+            size: "1536x1024",
+          });
+          fs.writeFileSync(framePath, imageBuffer);
         }
 
-        fs.writeFileSync(framePath, Buffer.from(imageBase64, "base64"));
+        console.log(`Saved frame: ${framePath}`);
 
         completedFrames += 1;
         await updateExport(exportId, {
@@ -323,8 +392,10 @@ app.post("/render", async (req, res) => {
       const sceneClipPath = path.join(tmpDir, `scene-${sceneIndex + 1}.mp4`);
       sceneClipPaths.push(sceneClipPath);
 
-      // Example: 4 frames / 4 seconds = 1 fps, 4 frames / 2 seconds = 2 fps
-      const fps = Math.max(1, scene.frames.length / Math.max(1, scene.duration_seconds));
+      const fps = Math.max(
+        1,
+        scene.frames.length / Math.max(1, scene.duration_seconds)
+      );
 
       await runFfmpeg([
         "-y",
@@ -366,7 +437,7 @@ app.post("/render", async (req, res) => {
       listPath,
       "-c",
       "copy",
-      slideshowPath,
+      combinedScenesPath,
     ]);
 
     await updateExport(exportId, { progress: 75 });
@@ -376,7 +447,7 @@ app.post("/render", async (req, res) => {
     await runFfmpeg([
       "-y",
       "-i",
-      slideshowPath,
+      combinedScenesPath,
       "-i",
       narrationPath,
       "-c:v",
