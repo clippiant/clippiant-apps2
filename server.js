@@ -262,16 +262,9 @@ async function renderSceneClipFromFrames({
   durationSeconds,
 }) {
   const filter = [
-    // fit into 16:9
-    "scale=1408:792:force_original_aspect_ratio=increase",
+    "scale=1280:720:force_original_aspect_ratio=increase",
     "crop=1280:720",
-
-    // gentle camera motion
-    "zoompan=z='min(zoom+0.0008,1.06)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-
-    // interpolate between low-fps source frames into smoother motion
     "minterpolate=fps=24:mi_mode=mci:mc_mode=aobmc:me_mode=bidir",
-
     "format=yuv420p",
   ].join(",");
 
@@ -281,8 +274,6 @@ async function renderSceneClipFromFrames({
     String(fps),
     "-i",
     path.join(sceneDir, "frame_%04d.png"),
-    "-t",
-    String(durationSeconds),
     "-vf",
     filter,
     "-c:v",
@@ -291,6 +282,8 @@ async function renderSceneClipFromFrames({
     "yuv420p",
     "-r",
     "24",
+    "-t",
+    String(durationSeconds),
     outputPath,
   ]);
 }
@@ -310,28 +303,40 @@ async function mergeSceneClipsWithTransitions(
     durations.push(await getMediaDuration(clip));
   }
 
+  // Clamp transition so it never exceeds half the shortest clip
+  const shortestClip = Math.min(...durations);
+  const safeTransition = Math.min(
+    transitionDuration,
+    Math.max(0.1, shortestClip / 2)
+  );
+
   const args = ["-y"];
   for (const clip of sceneClipPaths) {
     args.push("-i", clip);
   }
 
-  let filter = "";
+  const parts = [];
+
   for (let i = 0; i < sceneClipPaths.length; i++) {
-    filter += `[${i}:v]format=yuv420p,setpts=PTS-STARTPTS[v${i}];`;
+    parts.push(`[${i}:v]format=yuv420p,setpts=PTS-STARTPTS[v${i}]`);
   }
 
-  let cumulativeOffset = durations[0] - transitionDuration;
+  let cumulativeOffset = durations[0] - safeTransition;
   let currentLabel = "[v0]";
 
   for (let i = 1; i < sceneClipPaths.length; i++) {
     const nextLabel = `[v${i}]`;
     const outLabel = i === sceneClipPaths.length - 1 ? "[vout]" : `[vx${i}]`;
 
-    filter += `${currentLabel}${nextLabel}xfade=transition=fade:duration=${transitionDuration}:offset=${cumulativeOffset}${outLabel};`;
+    parts.push(
+      `${currentLabel}${nextLabel}xfade=transition=fade:duration=${safeTransition}:offset=${cumulativeOffset}${outLabel}`
+    );
 
     currentLabel = outLabel;
-    cumulativeOffset += durations[i] - transitionDuration;
+    cumulativeOffset += durations[i] - safeTransition;
   }
+
+  const filter = parts.join(";");
 
   await runFfmpeg([
     ...args,
@@ -718,3 +723,4 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Worker listening on ${port}`);
 });
+
