@@ -14,13 +14,15 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Optional polish features
+// Optional polish controls
 const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
-const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.5");
-const SUBTITLE_FONT_PATH =
-  process.env.SUBTITLE_FONT_PATH ||
-  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
+
+// IMPORTANT:
+// If your exports table does not have a "stage" column yet, either:
+// 1) add it in Supabase, or
+// 2) remove all `stage:` fields from updateExport(...) calls below.
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -102,7 +104,7 @@ async function getMediaDuration(filePath) {
 async function updateExport(exportId, values) {
   const { error } = await supabase.from("exports").update(values).eq("id", exportId);
   if (error) {
-    console.error("Failed to update export:", exportId, error.message);
+    throw new Error(`Failed to update export ${exportId}: ${error.message}`);
   }
 }
 
@@ -111,36 +113,18 @@ function toPositiveInt(value, fallback) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
-function sanitizeFilenamePart(value) {
-  return String(value || "")
-    .replace(/[^\w\-]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 40);
+function defaultFramePrompt(index, count) {
+  if (index === 0) return "Initial moment of the scene.";
+  if (index === 1) return "A subtle continuation.";
+  if (index === count - 1) return "Final moment of the scene.";
+  return `Frame ${index + 1} continuation.`;
 }
 
-function escapeDrawtext(value) {
-  return String(value || "")
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\\\\'")
-    .replace(/,/g, "\\,")
-    .replace(/\[/g, "\\[")
-    .replace(/\]/g, "\\]")
-    .replace(/\n/g, " ");
-}
-
-function srtTimestamp(seconds) {
-  const totalMs = Math.max(0, Math.floor(seconds * 1000));
-  const hours = Math.floor(totalMs / 3600000);
-  const minutes = Math.floor((totalMs % 3600000) / 60000);
-  const secs = Math.floor((totalMs % 60000) / 1000);
-  const ms = totalMs % 1000;
-
-  return [
-    String(hours).padStart(2, "0"),
-    String(minutes).padStart(2, "0"),
-    String(secs).padStart(2, "0"),
-  ].join(":") + `,${String(ms).padStart(3, "0")}`;
+function makeDefaultFrames(count) {
+  return Array.from({ length: count }).map((_, index) => ({
+    frame_index: index,
+    delta_prompt: defaultFramePrompt(index, count),
+  }));
 }
 
 function normalizeScenes(project) {
@@ -157,39 +141,26 @@ function normalizeScenes(project) {
           "Keep the same subject identity, same environment layout, same camera angle, same lighting, same color palette, and same style across every frame. Do not make this look like a comic panel, storyboard, or separate illustration.",
         duration_seconds: 4,
         frame_count: 4,
-        frames: [
-          { frame_index: 0, delta_prompt: "Initial moment of the scene." },
-          { frame_index: 1, delta_prompt: "A subtle continuation with slight motion." },
-          { frame_index: 2, delta_prompt: "Another small motion progression in the same composition." },
-          { frame_index: 3, delta_prompt: "Final moment of the scene with subtle progression." },
-        ],
+        frames: makeDefaultFrames(4),
       },
     ];
   }
 
   return rawScenes.map((scene, sceneIndex) => {
-    const durationSeconds = toPositiveInt(scene?.duration_seconds, 4);
-    const fallbackFrameCount = toPositiveInt(scene?.frame_count, 4);
+    const initialCount = toPositiveInt(scene?.frame_count, 4);
 
-    let frames = Array.isArray(scene?.frames) ? scene.frames : [];
+    const rawFrames =
+      Array.isArray(scene?.frames) && scene.frames.length > 0
+        ? scene.frames
+        : makeDefaultFrames(initialCount);
 
-    if (!frames.length) {
-      frames = Array.from({ length: fallbackFrameCount }).map((_, frameIndex) => ({
-        frame_index: frameIndex,
-        delta_prompt:
-          frameIndex === 0
-            ? "Initial moment of the scene."
-            : frameIndex === fallbackFrameCount - 1
-            ? "Final moment of the scene with subtle progression."
-            : `A subtle continuation of the same scene, frame ${frameIndex + 1}.`,
-      }));
-    }
-
-    frames = frames.map((frame, frameIndex) => ({
-      frame_index: frameIndex,
+    const frames = rawFrames.map((frame, frameIndex, arr) => ({
+      frame_index:
+        typeof frame?.frame_index === "number" ? frame.frame_index : frameIndex,
       delta_prompt:
-        frame?.delta_prompt ||
-        `A subtle continuation of the same scene, frame ${frameIndex + 1}.`,
+        typeof frame?.delta_prompt === "string" && frame.delta_prompt.trim()
+          ? frame.delta_prompt
+          : defaultFramePrompt(frameIndex, arr.length),
     }));
 
     return {
@@ -206,26 +177,24 @@ function normalizeScenes(project) {
       continuity_rules:
         scene?.continuity_rules ||
         "Keep the same subject identity, same environment layout, same camera angle, same lighting, same color palette, and same style across every frame. Do not make this look like a comic panel, storyboard, or separate illustration.",
-      duration_seconds: durationSeconds,
+      duration_seconds: toPositiveInt(scene?.duration_seconds, 4),
       frame_count: frames.length,
       frames,
     };
   });
 }
 
-function buildFramePrompt(scene, frame, isReferenceBased = false) {
+function buildFramePrompt(scene, frame, frameIndex, frameCount) {
   return [
     "Create a single frame from a cinematic AI video sequence.",
     "This frame must visually complement the other frames in the same scene.",
-    isReferenceBased
-      ? "Use the provided reference image to preserve the same subject identity, environment, framing, lighting, and overall composition."
-      : "Establish the visual identity of the scene clearly and consistently.",
     "Do not create a comic panel, storyboard frame, split panel, or separate illustration.",
     "Maintain temporal continuity and near-identical scene identity across frames.",
     "",
     `SCENE TITLE: ${scene.title}`,
     `SCENE BASE: ${scene.base_prompt}`,
     `CONTINUITY RULES: ${scene.continuity_rules}`,
+    `FRAME NUMBER: ${frameIndex + 1} of ${frameCount}`,
     `FRAME ACTION: ${frame.delta_prompt}`,
     "",
     "Requirements:",
@@ -237,11 +206,7 @@ function buildFramePrompt(scene, frame, isReferenceBased = false) {
     "- no text overlay",
     "- no comic-book look",
     "- no storyboard look",
-    "- no caption boxes",
     "- no split panels",
-    isReferenceBased
-      ? "- preserve the visual identity of the reference image while making only the requested subtle motion change"
-      : "- establish a strong, stable visual identity that later frames can follow",
   ].join("\n");
 }
 
@@ -265,14 +230,14 @@ function getTotalFrames(scenes) {
   }, 0);
 }
 
-function computeImageProgress(completedFrames, totalFrames) {
+function computeFrameGenerationProgress(completedFrames, totalFrames) {
   if (!totalFrames) return 20;
-  return Math.min(20 + Math.floor((completedFrames / totalFrames) * 20), 40);
+  return Math.min(20 + Math.floor((completedFrames / totalFrames) * 25), 45);
 }
 
 function computeSceneRenderProgress(completedScenes, totalScenes) {
-  if (!totalScenes) return 40;
-  return Math.min(40 + Math.floor((completedScenes / totalScenes) * 20), 60);
+  if (!totalScenes) return 45;
+  return Math.min(45 + Math.floor((completedScenes / totalScenes) * 20), 65);
 }
 
 async function generateImageFromPrompt(prompt) {
@@ -290,102 +255,25 @@ async function generateImageFromPrompt(prompt) {
   return Buffer.from(imageBase64, "base64");
 }
 
-async function editImageWithReference({
-  referencePath,
-  prompt,
-  size = "1536x1024",
-}) {
-  const form = new FormData();
-  form.append("model", "gpt-image-1");
-  form.append("prompt", prompt);
-  form.append("size", size);
-
-  const referenceBytes = fs.readFileSync(referencePath);
-  const referenceBlob = new Blob([referenceBytes], { type: "image/png" });
-  form.append("image[]", referenceBlob, "reference.png");
-
-  const response = await fetch("https://api.openai.com/v1/images/edits", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: form,
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Image edit failed: ${response.status} ${text}`);
-  }
-
-  const json = await response.json();
-  const imageBase64 = json?.data?.[0]?.b64_json;
-
-  if (!imageBase64) {
-    throw new Error("Image edit failed: no b64_json returned");
-  }
-
-  return Buffer.from(imageBase64, "base64");
-}
-
-function writeSceneSubtitles(srtPath, scenes, transitionDuration) {
-  let cursor = 0;
-  const blocks = [];
-
-  for (let i = 0; i < scenes.length; i++) {
-    const scene = scenes[i];
-    const subtitleText = String(scene?.narration || "").trim();
-    if (!subtitleText) {
-      cursor += Number(scene.duration_seconds || 0);
-      continue;
-    }
-
-    const start = cursor;
-    const end = cursor + Number(scene.duration_seconds || 0);
-
-    blocks.push(
-      `${blocks.length + 1}`,
-      `${srtTimestamp(start)} --> ${srtTimestamp(Math.max(start + 0.6, end - transitionDuration * 0.25))}`,
-      subtitleText,
-      ""
-    );
-
-    cursor = end;
-    if (i < scenes.length - 1) {
-      cursor -= transitionDuration;
-    }
-  }
-
-  fs.writeFileSync(srtPath, blocks.join("\n"), "utf8");
-}
-
-async function applySubtitles(inputPath, outputPath, srtPath) {
-  const subtitlePathForFfmpeg = srtPath
-    .replace(/\\/g, "/")
-    .replace(/:/g, "\\:");
-
-  await runFfmpeg([
-    "-y",
-    "-i",
-    inputPath,
-    "-vf",
-    `subtitles='${subtitlePathForFfmpeg}':force_style='FontName=DejaVu Sans,FontSize=20,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=1,Shadow=0,MarginV=28'`,
-    "-c:v",
-    "libx264",
-    "-pix_fmt",
-    "yuv420p",
-    "-an",
-    outputPath,
-  ]);
-}
-
 async function renderSceneClipFromFrames({
   sceneDir,
   outputPath,
   fps,
   durationSeconds,
 }) {
-  const subtleMotionFilter =
-    "scale=1408:792,crop=1280:720:x='(in_w-out_w)/2 + 10*sin(t*0.4)':y='(in_h-out_h)/2 + 6*cos(t*0.3)',format=yuv420p";
+  const filter = [
+    // fit into 16:9
+    "scale=1408:792:force_original_aspect_ratio=increase",
+    "crop=1280:720",
+
+    // gentle camera motion
+    "zoompan=z='min(zoom+0.0008,1.06)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+
+    // interpolate between low-fps source frames into smoother motion
+    "minterpolate=fps=24:mi_mode=mci:mc_mode=aobmc:me_mode=bidir",
+
+    "format=yuv420p",
+  ].join(",");
 
   await runFfmpeg([
     "-y",
@@ -393,21 +281,25 @@ async function renderSceneClipFromFrames({
     String(fps),
     "-i",
     path.join(sceneDir, "frame_%04d.png"),
+    "-t",
+    String(durationSeconds),
     "-vf",
-    subtleMotionFilter,
+    filter,
     "-c:v",
     "libx264",
     "-pix_fmt",
     "yuv420p",
     "-r",
-    "30",
-    "-t",
-    String(durationSeconds),
+    "24",
     outputPath,
   ]);
 }
 
-async function mergeSceneClipsWithTransitions(sceneClipPaths, outputPath, transitionDuration) {
+async function mergeSceneClipsWithTransitions(
+  sceneClipPaths,
+  outputPath,
+  transitionDuration
+) {
   if (sceneClipPaths.length === 1) {
     fs.copyFileSync(sceneClipPaths[0], outputPath);
     return;
@@ -419,7 +311,6 @@ async function mergeSceneClipsWithTransitions(sceneClipPaths, outputPath, transi
   }
 
   const args = ["-y"];
-
   for (const clip of sceneClipPaths) {
     args.push("-i", clip);
   }
@@ -442,7 +333,8 @@ async function mergeSceneClipsWithTransitions(sceneClipPaths, outputPath, transi
     cumulativeOffset += durations[i] - transitionDuration;
   }
 
-  args.push(
+  await runFfmpeg([
+    ...args,
     "-filter_complex",
     filter,
     "-map",
@@ -451,10 +343,75 @@ async function mergeSceneClipsWithTransitions(sceneClipPaths, outputPath, transi
     "libx264",
     "-pix_fmt",
     "yuv420p",
-    outputPath
-  );
+    outputPath,
+  ]);
+}
 
-  await runFfmpeg(args);
+function srtTimestamp(seconds) {
+  const totalMs = Math.max(0, Math.floor(seconds * 1000));
+  const hours = Math.floor(totalMs / 3600000);
+  const minutes = Math.floor((totalMs % 3600000) / 60000);
+  const secs = Math.floor((totalMs % 60000) / 1000);
+  const ms = totalMs % 1000;
+
+  return (
+    [
+      String(hours).padStart(2, "0"),
+      String(minutes).padStart(2, "0"),
+      String(secs).padStart(2, "0"),
+    ].join(":") + `,${String(ms).padStart(3, "0")}`
+  );
+}
+
+function writeSceneSubtitles(srtPath, scenes, transitionDuration) {
+  let cursor = 0;
+  const lines = [];
+
+  for (let i = 0; i < scenes.length; i++) {
+    const scene = scenes[i];
+    const subtitleText = String(scene?.narration || "").trim();
+
+    if (subtitleText) {
+      const start = cursor;
+      const end = cursor + Number(scene.duration_seconds || 0);
+
+      lines.push(
+        `${lines.filter((x) => x === "").length + 1}`,
+        `${srtTimestamp(start)} --> ${srtTimestamp(
+          Math.max(start + 0.6, end - transitionDuration * 0.25)
+        )}`,
+        subtitleText,
+        ""
+      );
+    }
+
+    cursor += Number(scene.duration_seconds || 0);
+    if (i < scenes.length - 1) {
+      cursor -= transitionDuration;
+    }
+  }
+
+  fs.writeFileSync(srtPath, lines.join("\n"), "utf8");
+}
+
+async function applySubtitles(inputPath, outputPath, srtPath) {
+  const subtitlePathForFfmpeg = srtPath
+    .replace(/\\/g, "/")
+    .replace(/:/g, "\\:");
+
+  await runFfmpeg([
+    "-y",
+    "-i",
+    inputPath,
+    "-vf",
+    `subtitles='${subtitlePathForFfmpeg}':force_style='FontName=DejaVu Sans,FontSize=20,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=1,Shadow=0,MarginV=28'`,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-an",
+    outputPath,
+  ]);
 }
 
 async function mergeVideoWithNarrationAndMusic({
@@ -529,6 +486,7 @@ app.post("/render", async (req, res) => {
 
   console.log("Received render request for exportId:", exportId);
 
+  // Respond immediately
   res.json({ ok: true });
 
   let tmpDir = null;
@@ -537,6 +495,7 @@ app.post("/render", async (req, res) => {
     await updateExport(exportId, {
       status: "rendering",
       progress: 5,
+      stage: "starting",
       error: null,
       video_url: null,
     });
@@ -564,18 +523,18 @@ app.post("/render", async (req, res) => {
     const scenes = normalizeScenes(project);
     const narrationText = getNarrationText(project, scenes);
 
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clippiant-"));
+
+    const narrationPath = path.join(tmpDir, "narration.mp3");
+    const mergedScenesPath = path.join(tmpDir, "merged-scenes.mp4");
+    const subtitledVideoPath = path.join(tmpDir, "subtitled-scenes.mp4");
+    const finalVideoPath = path.join(tmpDir, `${exportId}.mp4`);
+    const subtitlesPath = path.join(tmpDir, "subtitles.srt");
+
     await updateExport(exportId, {
       progress: 10,
       stage: "generating_narration",
     });
-
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clippiant-"));
-
-    const narrationPath = path.join(tmpDir, "narration.mp3");
-    const transitionedVideoPath = path.join(tmpDir, "video-transitioned.mp4");
-    const subtitledVideoPath = path.join(tmpDir, "video-subtitled.mp4");
-    const finalVideoPath = path.join(tmpDir, `${exportId}.mp4`);
-    const subtitlesPath = path.join(tmpDir, "subtitles.srt");
 
     console.log("Generating narration audio");
 
@@ -593,7 +552,7 @@ app.post("/render", async (req, res) => {
       stage: "generating_frames",
     });
 
-    console.log("Generating AI frame sequences for scenes");
+    console.log("Generating scene frames");
 
     const sceneClipPaths = [];
     const totalFrames = getTotalFrames(scenes);
@@ -601,75 +560,54 @@ app.post("/render", async (req, res) => {
 
     for (let sceneIndex = 0; sceneIndex < scenes.length; sceneIndex++) {
       const scene = scenes[sceneIndex];
-      const sceneDir = path.join(
-        tmpDir,
-        `scene-${String(sceneIndex + 1).padStart(2, "0")}-${sanitizeFilenamePart(scene.title)}`
-      );
+      const sceneDir = path.join(tmpDir, `scene-${String(sceneIndex + 1).padStart(2, "0")}`);
       fs.mkdirSync(sceneDir, { recursive: true });
 
-      let referenceFramePath = null;
+      const frameCount = Array.isArray(scene.frames) ? scene.frames.length : 0;
 
-      for (let frameIndex = 0; frameIndex < scene.frames.length; frameIndex++) {
+      for (let frameIndex = 0; frameIndex < frameCount; frameIndex++) {
         const frame = scene.frames[frameIndex];
         const framePath = path.join(
           sceneDir,
           `frame_${String(frameIndex + 1).padStart(4, "0")}.png`
         );
 
-        const isFirstFrame = frameIndex === 0;
+        const prompt = buildFramePrompt(scene, frame, frameIndex, frameCount);
 
         console.log(
-          `Generating image for scene ${sceneIndex + 1}/${scenes.length}, frame ${frameIndex + 1}/${scene.frames.length}`
+          `Generating scene ${sceneIndex + 1}/${scenes.length}, frame ${frameIndex + 1}/${frameCount}`
         );
 
-        let imageBuffer;
-
-        if (isFirstFrame) {
-          const prompt = buildFramePrompt(scene, frame, false);
-          console.log("Using base generation for first frame");
-          imageBuffer = await generateImageFromPrompt(prompt);
-          fs.writeFileSync(framePath, imageBuffer);
-          referenceFramePath = framePath;
-        } else {
-          const prompt = buildFramePrompt(scene, frame, true);
-          console.log("Using reference-based edit for subsequent frame");
-          console.log("Reference frame used:", referenceFramePath);
-          imageBuffer = await editImageWithReference({
-            referencePath: referenceFramePath,
-            prompt,
-            size: "1536x1024",
-          });
-          fs.writeFileSync(framePath, imageBuffer);
-        }
-
-        console.log(`Saved frame: ${framePath}`);
+        const imageBuffer = await generateImageFromPrompt(prompt);
+        fs.writeFileSync(framePath, imageBuffer);
 
         completedFrames += 1;
         await updateExport(exportId, {
-          progress: computeImageProgress(completedFrames, totalFrames),
+          progress: computeFrameGenerationProgress(completedFrames, totalFrames),
           stage: "generating_frames",
         });
       }
 
-      console.log(`Rendering stop-motion clip for scene ${sceneIndex + 1}`);
+      console.log(`Rendering video clip for scene ${sceneIndex + 1}`);
 
       const sceneClipPath = path.join(
         tmpDir,
         `scene-clip-${String(sceneIndex + 1).padStart(2, "0")}.mp4`
       );
-      sceneClipPaths.push(sceneClipPath);
 
       const fps = Math.max(
         1,
-        scene.frames.length / Math.max(1, scene.duration_seconds)
+        frameCount / Math.max(1, Number(scene.duration_seconds || 4))
       );
 
       await renderSceneClipFromFrames({
         sceneDir,
         outputPath: sceneClipPath,
         fps,
-        durationSeconds: scene.duration_seconds,
+        durationSeconds: Number(scene.duration_seconds || 4),
       });
+
+      sceneClipPaths.push(sceneClipPath);
 
       await updateExport(exportId, {
         progress: computeSceneRenderProgress(sceneIndex + 1, scenes.length),
@@ -678,34 +616,36 @@ app.post("/render", async (req, res) => {
     }
 
     await updateExport(exportId, {
-      progress: 65,
+      progress: 70,
       stage: "merging_video",
     });
 
     console.log("Merging scene clips with transitions");
+
     await mergeSceneClipsWithTransitions(
       sceneClipPaths,
-      transitionedVideoPath,
+      mergedScenesPath,
       TRANSITION_DURATION
     );
 
     await updateExport(exportId, {
-      progress: 72,
+      progress: 78,
       stage: "adding_subtitles",
     });
 
     console.log("Writing subtitles");
     writeSceneSubtitles(subtitlesPath, scenes, TRANSITION_DURATION);
 
-    console.log("Burning subtitles into video");
-    await applySubtitles(transitionedVideoPath, subtitledVideoPath, subtitlesPath);
+    console.log("Burning subtitles");
+    await applySubtitles(mergedScenesPath, subtitledVideoPath, subtitlesPath);
 
     await updateExport(exportId, {
-      progress: 82,
+      progress: 88,
       stage: "adding_audio",
     });
 
-    console.log("Merging narration and background music");
+    console.log("Merging narration and optional background music");
+
     await mergeVideoWithNarrationAndMusic({
       videoPath: subtitledVideoPath,
       narrationPath,
@@ -715,7 +655,7 @@ app.post("/render", async (req, res) => {
     });
 
     await updateExport(exportId, {
-      progress: 92,
+      progress: 94,
       stage: "uploading",
     });
 
@@ -758,11 +698,15 @@ app.post("/render", async (req, res) => {
 
     console.error("Render failed:", message);
 
-    await updateExport(exportId, {
-      status: "failed",
-      error: message,
-      stage: "failed",
-    });
+    try {
+      await updateExport(exportId, {
+        status: "failed",
+        stage: "failed",
+        error: message,
+      });
+    } catch (updateError) {
+      console.error("Failed to write failed status:", updateError?.message || updateError);
+    }
   } finally {
     if (tmpDir) {
       fs.rmSync(tmpDir, { recursive: true, force: true });
