@@ -702,12 +702,16 @@ async function applySubtitles(inputPath, outputPath, srtPath) {
     .replace(/\\/g, "/")
     .replace(/:/g, "\\:");
 
+  const subtitleFilter =
+    `subtitles=${subtitlePathForFfmpeg}` +
+    `:force_style=FontName=DejaVuSans,FontSize=20,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=1,Shadow=0,MarginV=28`;
+
   await runFfmpeg([
     "-y",
     "-i",
     inputPath,
     "-vf",
-    `subtitles='${subtitlePathForFfmpeg}':force_style='FontName=DejaVu Sans,FontSize=20,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=1,Shadow=0,MarginV=28'`,
+    subtitleFilter,
     "-c:v",
     "libx264",
     "-pix_fmt",
@@ -1048,3 +1052,4 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Worker listening on ${port}`);
 });
+
