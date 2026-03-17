@@ -18,7 +18,6 @@ const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
 const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
 
-// IMPORTANT:
 // If your exports table does not have a "stage" column yet,
 // either add it in Supabase or remove all `stage:` fields below.
 
@@ -112,10 +111,10 @@ function toPositiveInt(value, fallback) {
 }
 
 function defaultFramePrompt(index, count) {
-  if (index === 0) return "Initial moment of the scene.";
-  if (index === 1) return "A subtle continuation.";
-  if (index === count - 1) return "Final moment of the scene.";
-  return `Frame ${index + 1} continuation.`;
+  if (index === 0) return "Opening moment of the scene.";
+  if (index === 1) return "A subtle continuation of the same shot.";
+  if (index === count - 1) return "Closing moment of the scene.";
+  return `A very small natural continuation of the same shot, frame ${index + 1}.`;
 }
 
 function makeDefaultFrames(count) {
@@ -189,29 +188,92 @@ function normalizeScenes(project) {
   });
 }
 
+function densifySceneFrames(scene) {
+  const duration = toPositiveInt(scene?.duration_seconds, 4);
+
+  // around 3 source frames per second, capped for cost control
+  const targetCount = Math.min(Math.max(duration * 3, 8), 24);
+
+  const existingFrames = Array.isArray(scene?.frames) ? scene.frames : [];
+  if (existingFrames.length >= targetCount) {
+    return {
+      ...scene,
+      frame_count: existingFrames.length,
+      frames: existingFrames.map((frame, index, arr) => ({
+        frame_index: index,
+        delta_prompt:
+          typeof frame?.delta_prompt === "string" && frame.delta_prompt.trim()
+            ? frame.delta_prompt
+            : defaultFramePrompt(index, arr.length),
+      })),
+    };
+  }
+
+  const expandedFrames = Array.from({ length: targetCount }).map((_, index) => {
+    const ratio = targetCount === 1 ? 0 : index / (targetCount - 1);
+
+    let chosenPrompt = "";
+    if (existingFrames.length) {
+      const sourceIndex = Math.min(
+        existingFrames.length - 1,
+        Math.floor(ratio * existingFrames.length)
+      );
+      chosenPrompt = existingFrames[sourceIndex]?.delta_prompt || "";
+    }
+
+    return {
+      frame_index: index,
+      delta_prompt:
+        chosenPrompt && chosenPrompt.trim()
+          ? `${chosenPrompt} Small natural progression from the previous frame.`
+          : index === 0
+          ? "Opening moment of the scene."
+          : index === targetCount - 1
+          ? "Final natural moment of the scene."
+          : `Subtle continuation of the same moment, frame ${index + 1}.`,
+    };
+  });
+
+  return {
+    ...scene,
+    frame_count: expandedFrames.length,
+    frames: expandedFrames,
+  };
+}
+
 function buildFramePrompt(scene, frame, frameIndex, frameCount) {
+  const progressionHint =
+    frameIndex === 0
+      ? "This is the opening frame of the scene."
+      : frameIndex === frameCount - 1
+      ? "This is the closing frame of the scene."
+      : "This frame should look like a very small natural continuation of the immediately previous frame.";
+
   return [
-    "Create a single frame from a cinematic AI video sequence.",
-    "This frame must visually complement the other frames in the same scene.",
-    "Do not create a comic panel, storyboard frame, split panel, or separate illustration.",
-    "Maintain temporal continuity and near-identical scene identity across frames.",
+    "Create a single cinematic video frame.",
+    "This image must belong to the same continuous shot as the neighboring frames.",
+    "Do not create a comic panel, storyboard, collage, or split image.",
+    "Do not drastically change composition between frames.",
     "",
     `SCENE TITLE: ${scene.title}`,
     `SCENE BASE: ${scene.base_prompt}`,
     `CONTINUITY RULES: ${scene.continuity_rules}`,
     `FRAME NUMBER: ${frameIndex + 1} of ${frameCount}`,
     `FRAME ACTION: ${frame.delta_prompt}`,
+    `PROGRESSION HINT: ${progressionHint}`,
     "",
-    "Requirements:",
+    "Hard constraints:",
     "- same subject identity",
-    "- same environment layout",
-    "- same camera angle unless explicitly changed slightly",
+    "- same environment",
+    "- same lens feel",
+    "- same camera angle or only tiny camera movement",
     "- same lighting and color palette",
     "- realistic cinematic frame",
-    "- no text overlay",
-    "- no comic-book look",
-    "- no storyboard look",
-    "- no split panels",
+    "- no text",
+    "- no comic-book style",
+    "- no storyboard style",
+    "- no panel layout",
+    "- only subtle motion change between neighboring frames",
   ].join("\n");
 }
 
@@ -560,7 +622,7 @@ async function renderSceneClipFromFrames({
   const filter = [
     "scale=1280:720:force_original_aspect_ratio=increase",
     "crop=1280:720",
-    "minterpolate=fps=24:mi_mode=mci:mc_mode=aobmc:me_mode=bidir",
+    "fps=24",
     "format=yuv420p",
   ].join(",");
 
@@ -825,7 +887,7 @@ app.post("/render", async (req, res) => {
       throw new Error(projectError?.message || "Project not found");
     }
 
-    const scenes = normalizeScenes(project);
+    const scenes = normalizeScenes(project).map(densifySceneFrames);
     const audioMode = getAudioMode(job, project);
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clippiant-"));
@@ -912,8 +974,11 @@ app.post("/render", async (req, res) => {
       );
 
       const fps = Math.max(
-        1,
-        frameCount / Math.max(1, Number(scene.duration_seconds || 4))
+        2,
+        Math.min(
+          8,
+          frameCount / Math.max(1, Number(scene.duration_seconds || 4))
+        )
       );
 
       await renderSceneClipFromFrames({
@@ -1052,4 +1117,3 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Worker listening on ${port}`);
 });
-
