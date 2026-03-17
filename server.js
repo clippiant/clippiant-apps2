@@ -125,9 +125,12 @@ function toPositiveInt(value, fallback) {
 
 function normalizeVideoSeconds(value) {
   const n = Number(value);
-  if (n >= 12) return 12;
-  if (n >= 8) return 8;
-  return 4;
+
+  if (n >= 20) return "20";
+  if (n >= 16) return "16";
+  if (n >= 12) return "12";
+  if (n >= 8) return "8";
+  return "4";
 }
 
 function normalizeScenes(project) {
