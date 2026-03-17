@@ -760,6 +760,7 @@ async function createSceneVideoClip({
   sceneIndex,
   totalScenes,
   outputPath,
+  seconds,
 }) {
   const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
 
@@ -891,6 +892,7 @@ app.post("/render", async (req, res) => {
         sceneIndex,
         totalScenes: scenes.length,
         outputPath: sceneClipPath,
+        seconds: normalizeVideoSeconds(scene.duration_seconds || DEFAULT_SCENE_SECONDS),
       });
 
       sceneClipPaths.push(sceneClipPath);
