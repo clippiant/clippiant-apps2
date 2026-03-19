@@ -666,6 +666,26 @@ async function applySubtitles(inputPath, outputPath, srtPath) {
   ]);
 }
 
+async function checkIfVideoHasAudio(filePath) {
+  try {
+    const { stdout } = await runProcess("ffprobe", [
+      "-v",
+      "error",
+      "-select_streams",
+      "a",
+      "-show_entries",
+      "stream=codec_type",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ]);
+
+    return String(stdout).trim().includes("audio");
+  } catch {
+    return false;
+  }
+}
+
 async function mergeVideoWithFinalAudio({
   videoPath,
   finalAudioPath,
@@ -678,17 +698,29 @@ async function mergeVideoWithFinalAudio({
     fs.existsSync(backgroundMusicPath) &&
     fs.statSync(backgroundMusicPath).isFile();
 
-  if (!hasMusic) {
+  const videoHasAudio = await checkIfVideoHasAudio(videoPath);
+
+  // Case 1: video already has audio, and we also have generated audio
+  if (videoHasAudio && hasMusic) {
     await runFfmpeg([
       "-y",
       "-i",
       videoPath,
       "-i",
       finalAudioPath,
+      "-stream_loop",
+      "-1",
+      "-i",
+      backgroundMusicPath,
+      "-filter_complex",
+      `[0:a]volume=1.0[videoaud];` +
+        `[1:a]volume=1.0[main];` +
+        `[2:a]volume=${bgmVolume}[bgm];` +
+        `[videoaud][main][bgm]amix=inputs=3:duration=first:dropout_transition=2[aout]`,
       "-map",
       "0:v:0",
       "-map",
-      "1:a:0",
+      "[aout]",
       "-c:v",
       "copy",
       "-c:a",
@@ -699,22 +731,73 @@ async function mergeVideoWithFinalAudio({
     return;
   }
 
+  // Case 2: video has audio + generated audio, no music
+  if (videoHasAudio && !hasMusic) {
+    await runFfmpeg([
+      "-y",
+      "-i",
+      videoPath,
+      "-i",
+      finalAudioPath,
+      "-filter_complex",
+      `[0:a]volume=1.0[videoaud];` +
+        `[1:a]volume=1.0[main];` +
+        `[videoaud][main]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
+      "-map",
+      "0:v:0",
+      "-map",
+      "[aout]",
+      "-c:v",
+      "copy",
+      "-c:a",
+      "aac",
+      "-shortest",
+      outputPath,
+    ]);
+    return;
+  }
+
+  // Case 3: no video audio, but music exists
+  if (!videoHasAudio && hasMusic) {
+    await runFfmpeg([
+      "-y",
+      "-i",
+      videoPath,
+      "-i",
+      finalAudioPath,
+      "-stream_loop",
+      "-1",
+      "-i",
+      backgroundMusicPath,
+      "-filter_complex",
+      `[1:a]volume=1.0[main];` +
+        `[2:a]volume=${bgmVolume}[bgm];` +
+        `[main][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
+      "-map",
+      "0:v:0",
+      "-map",
+      "[aout]",
+      "-c:v",
+      "copy",
+      "-c:a",
+      "aac",
+      "-shortest",
+      outputPath,
+    ]);
+    return;
+  }
+
+  // Case 4: only generated audio
   await runFfmpeg([
     "-y",
     "-i",
     videoPath,
     "-i",
     finalAudioPath,
-    "-stream_loop",
-    "-1",
-    "-i",
-    backgroundMusicPath,
-    "-filter_complex",
-    `[1:a]volume=1.0[main];[2:a]volume=${bgmVolume}[bgm];[main][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
     "-map",
     "0:v:0",
     "-map",
-    "[aout]",
+    "1:a:0",
     "-c:v",
     "copy",
     "-c:a",
