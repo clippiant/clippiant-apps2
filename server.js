@@ -226,31 +226,34 @@ function buildSceneVideoPrompt(scene, sceneIndex, totalScenes) {
   const sfxText = Array.isArray(scene?.sound_effects)
     ? scene.sound_effects
         .filter((fx) => typeof fx?.prompt === "string" && fx.prompt.trim())
-        .map((fx) => fx.prompt)
-        .join("; ")
+        .map((fx) => `- ${fx.prompt}`)
+        .join("\n")
     : "";
 
   return [
-    "Create a cinematic AI video shot with natural synced audio.",
+    "Create a cinematic AI video shot with synchronized native audio.",
+    "Audio and visuals must match as closely as possible.",
+    "If a visible character speaks, their lip movements and facial performance should match the spoken line.",
+    "If an on-screen action creates a sound, the timing of that sound should match the action.",
     "This should feel like a real video clip, not a slideshow, not a storyboard, and not a sequence of still images.",
     "",
-    `SCENE TITLE: ${scene.title}`,
-    `BASE SCENE: ${scene.base_prompt}`,
-    `CONTINUITY RULES: ${scene.continuity_rules}`,
+    `SCENE TITLE: ${scene.title || ""}`,
+    `BASE SCENE: ${scene.base_prompt || ""}`,
+    `CONTINUITY RULES: ${scene.continuity_rules || ""}`,
     `POSITION IN VIDEO: Scene ${sceneIndex + 1} of ${totalScenes}`,
     `POSITION HINT: ${positionHint}`,
-    scene.narration ? `SCENE NARRATION CONTEXT: ${scene.narration}` : "",
-    dialogueText ? `DIALOGUE:\n${dialogueText}` : "",
-    sfxText ? `SOUND DESIGN INTENT: ${sfxText}` : "",
+    scene.narration ? `SCENE CONTEXT: ${scene.narration}` : "",
     "",
-    "Audio requirements:",
-    "- include realistic ambient sound appropriate to the setting",
-    "- include subtle environmental motion sound",
-    "- if people are present, include natural human movement sounds when appropriate",
-    "- if there is dialogue, sync spoken dialogue naturally to the scene",
-    "- avoid total silence unless the scene is intentionally quiet",
+    "DIALOGUE:",
+    dialogueText || "No spoken dialogue.",
     "",
-    "Visual requirements:",
+    "SOUND EFFECTS / ACTION AUDIO:",
+    sfxText || "- natural ambient audio only",
+    "",
+    "Requirements:",
+    "- synced spoken dialogue when visible characters speak",
+    "- synced action sounds where applicable",
+    "- realistic ambience",
     "- coherent natural motion",
     "- realistic camera behavior",
     "- stable subject identity",
@@ -312,6 +315,20 @@ function selectVoiceForSpeaker(speaker) {
   const voices = ["alloy", "echo", "fable", "nova", "onyx", "shimmer"];
   const index = stableHash(speaker || "default") % voices.length;
   return voices[index];
+}
+
+function getSceneAudioPolicy(scene) {
+  const hasVisibleDialogue =
+    Array.isArray(scene?.dialogue) &&
+    scene.dialogue.some(
+      (line) => typeof line?.text === "string" && line.text.trim()
+    );
+
+  if (hasVisibleDialogue) {
+    return "native_sync";
+  }
+
+  return "hybrid";
 }
 
 async function synthesizeSpeechToFile({ text, voice = "alloy", outputPath }) {
@@ -472,10 +489,7 @@ function buildSimpleFallbackSoundEffects(scene) {
     });
   }
 
-  if (
-    sceneText.includes("explosion") ||
-    sceneText.includes("blast")
-  ) {
+  if (sceneText.includes("explosion") || sceneText.includes("blast")) {
     effects.push({
       prompt: "loud cinematic explosion with echo and debris",
       start_seconds: 0,
@@ -523,7 +537,7 @@ async function generateSoundEffectToFile({
     headers: {
       "xi-api-key": ELEVENLABS_API_KEY,
       "Content-Type": "application/json",
-      "Accept": "audio/mpeg",
+      Accept: "audio/mpeg",
     },
     body: JSON.stringify({
       text: prompt,
@@ -632,7 +646,9 @@ async function buildSceneSfxTrack({
     : buildSimpleFallbackSoundEffects(scene);
 
   console.log(
-    `Scene ${sceneIndex} using ${savedEffects.length ? "saved" : autoEffects.length ? "auto-generated" : "fallback"} sound effects:`,
+    `Scene ${sceneIndex} using ${
+      savedEffects.length ? "saved" : autoEffects.length ? "auto-generated" : "fallback"
+    } sound effects:`,
     JSON.stringify(effects, null, 2)
   );
   console.log("ELEVENLABS KEY EXISTS:", !!ELEVENLABS_API_KEY);
@@ -683,7 +699,6 @@ async function buildSceneSfxTrack({
         ...fx,
         resolvedPath: generatedPath,
       });
-      continue;
     }
   }
 
@@ -749,10 +764,12 @@ async function buildFinalAudioTrack({
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
     const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
+    const sceneAudioPolicy = getSceneAudioPolicy(scene);
 
-    const dialoguePath = shouldGenerateDialogue(audioMode)
-      ? await buildSceneDialogueTrack({ scene, sceneIndex: i, tmpDir })
-      : null;
+    const dialoguePath =
+      shouldGenerateDialogue(audioMode) && sceneAudioPolicy !== "native_sync"
+        ? await buildSceneDialogueTrack({ scene, sceneIndex: i, tmpDir })
+        : null;
 
     const sfxPath = await buildSceneSfxTrack({ scene, sceneIndex: i, tmpDir });
 
@@ -831,7 +848,7 @@ async function buildFinalAudioTrack({
       "-i",
       narrationPath,
       "-filter_complex",
-      "[0:a]volume=1.0[scene];[1:a]volume=0.4[narr];[scene][narr]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
+      "[0:a]volume=1.0[scene];[1:a]volume=0.35[narr];[scene][narr]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
       "-map",
       "[aout]",
       "-c:a",
@@ -1013,8 +1030,8 @@ async function mergeVideoWithFinalAudio({
       "-i",
       backgroundMusicPath,
       "-filter_complex",
-      `[0:a]volume=0.9[videoaud];` +
-        `[1:a]volume=0.9[main];` +
+      `[0:a]volume=1.0[videoaud];` +
+        `[1:a]volume=0.45[main];` +
         `[2:a]volume=${bgmVolume}[bgm];` +
         `[videoaud][main][bgm]amix=inputs=3:duration=first:dropout_transition=2[aout]`,
       "-map",
@@ -1039,8 +1056,8 @@ async function mergeVideoWithFinalAudio({
       "-i",
       finalAudioPath,
       "-filter_complex",
-      `[0:a]volume=0.9[videoaud];` +
-        `[1:a]volume=0.9[main];` +
+      `[0:a]volume=1.0[videoaud];` +
+        `[1:a]volume=0.45[main];` +
         `[videoaud][main]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
       "-map",
       "0:v:0",
