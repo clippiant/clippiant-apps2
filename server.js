@@ -14,7 +14,6 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Cinematic defaults
 const VIDEO_MODEL = process.env.OPENAI_VIDEO_MODEL || "sora-2";
 const VIDEO_SIZE = process.env.OPENAI_VIDEO_SIZE || "1280x720";
 const DEFAULT_SCENE_SECONDS = Number(process.env.DEFAULT_SCENE_SECONDS || "4");
@@ -22,16 +21,16 @@ const MAX_SCENES_PER_EXPORT = Number(process.env.MAX_SCENES_PER_EXPORT || "4");
 const VIDEO_POLL_INTERVAL_MS = Number(process.env.VIDEO_POLL_INTERVAL_MS || "5000");
 const VIDEO_POLL_TIMEOUT_MS = Number(process.env.VIDEO_POLL_TIMEOUT_MS || "900000");
 
-// Audio / subtitles
 const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
 const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
 const ENABLE_SUBTITLES = String(process.env.ENABLE_SUBTITLES || "false") === "true";
 
-// ElevenLabs
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ENABLE_GENERATED_SFX =
   String(process.env.ENABLE_GENERATED_SFX || "true") === "true";
+const AUTO_GENERATE_SOUND_PLAN =
+  String(process.env.AUTO_GENERATE_SOUND_PLAN || "true") === "true";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -300,6 +299,21 @@ function shouldGenerateDialogue(audioMode) {
   return audioMode === "dialogue" || audioMode === "both";
 }
 
+function stableHash(str) {
+  let hash = 0;
+  const input = String(str || "");
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function selectVoiceForSpeaker(speaker) {
+  const voices = ["alloy", "echo", "fable", "nova", "onyx", "shimmer"];
+  const index = stableHash(speaker || "default") % voices.length;
+  return voices[index];
+}
+
 async function synthesizeSpeechToFile({ text, voice = "alloy", outputPath }) {
   const speech = await openai.audio.speech.create({
     model: "gpt-4o-mini-tts",
@@ -326,17 +340,173 @@ async function createSilentAudio(outputPath, durationSeconds) {
   ]);
 }
 
-function resolveSfxPath(type) {
-  const map = {
-    keyboard_typing: "/opt/render/project/src/assets/sfx/keyboard_typing.mp3",
-    whoosh: "/opt/render/project/src/assets/sfx/whoosh.mp3",
-    door_open: "/opt/render/project/src/assets/sfx/door_open.mp3",
-    click: "/opt/render/project/src/assets/sfx/click.mp3",
-    pop: "/opt/render/project/src/assets/sfx/pop.mp3",
-    notification: "/opt/render/project/src/assets/sfx/notification.mp3",
-  };
+async function generateUniversalSoundPlan(scene) {
+  if (!AUTO_GENERATE_SOUND_PLAN) {
+    return [];
+  }
 
-  return map[type] || null;
+  const prompt = [
+    "Create a compact sound design plan for one cinematic video scene.",
+    "Return JSON only.",
+    "Return an array of 1 to 3 sound effects.",
+    "Each sound effect must have:",
+    "- prompt",
+    "- start_seconds",
+    "- duration_seconds",
+    "- volume",
+    "The prompts should describe realistic cinematic sound effects or ambience.",
+    "Do not invent dialogue.",
+    "",
+    `Scene title: ${scene.title || ""}`,
+    `Scene base prompt: ${scene.base_prompt || ""}`,
+    `Scene narration: ${scene.narration || ""}`,
+    `Duration seconds: ${scene.duration_seconds || DEFAULT_SCENE_SECONDS}`,
+  ].join("\n");
+
+  try {
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: prompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "sound_plan",
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              sound_effects: {
+                type: "array",
+                maxItems: 3,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    prompt: { type: "string" },
+                    start_seconds: { type: "number" },
+                    duration_seconds: { type: "number" },
+                    volume: { type: "number" },
+                  },
+                  required: [
+                    "prompt",
+                    "start_seconds",
+                    "duration_seconds",
+                    "volume",
+                  ],
+                },
+              },
+            },
+            required: ["sound_effects"],
+          },
+        },
+      },
+    });
+
+    const raw = response.output_text || "{}";
+    const parsed = JSON.parse(raw);
+    const effects = Array.isArray(parsed?.sound_effects) ? parsed.sound_effects : [];
+
+    return effects.map((fx) => ({
+      prompt: String(fx.prompt || "").trim(),
+      start_seconds: Math.max(0, Number(fx.start_seconds) || 0),
+      duration_seconds: Math.max(
+        1,
+        Math.min(8, Number(fx.duration_seconds) || 3)
+      ),
+      volume: Math.max(0.1, Math.min(1.2, Number(fx.volume) || 0.8)),
+    }));
+  } catch (err) {
+    console.error("Auto sound plan generation failed:", err?.message || err);
+    return [];
+  }
+}
+
+function buildSimpleFallbackSoundEffects(scene) {
+  const sceneText = [
+    scene?.title || "",
+    scene?.base_prompt || "",
+    scene?.narration || "",
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const effects = [];
+
+  if (
+    sceneText.includes("kitchen") ||
+    sceneText.includes("cook") ||
+    sceneText.includes("oven") ||
+    sceneText.includes("cookie")
+  ) {
+    effects.push({
+      prompt: "soft kitchen ambience, distant oven hum, subtle ceramic clink",
+      start_seconds: 0,
+      duration_seconds: 3,
+      volume: 0.8,
+    });
+  }
+
+  if (
+    sceneText.includes("city") ||
+    sceneText.includes("street") ||
+    sceneText.includes("traffic")
+  ) {
+    effects.push({
+      prompt: "soft city ambience, distant traffic, light urban atmosphere",
+      start_seconds: 0,
+      duration_seconds: 3,
+      volume: 0.8,
+    });
+  }
+
+  if (
+    sceneText.includes("forest") ||
+    sceneText.includes("woods") ||
+    sceneText.includes("nature")
+  ) {
+    effects.push({
+      prompt: "gentle forest ambience, birds, subtle wind through leaves",
+      start_seconds: 0,
+      duration_seconds: 3,
+      volume: 0.8,
+    });
+  }
+
+  if (
+    sceneText.includes("explosion") ||
+    sceneText.includes("blast")
+  ) {
+    effects.push({
+      prompt: "loud cinematic explosion with echo and debris",
+      start_seconds: 0,
+      duration_seconds: 3,
+      volume: 1,
+    });
+  }
+
+  if (
+    sceneText.includes("door") ||
+    sceneText.includes("open") ||
+    sceneText.includes("enter")
+  ) {
+    effects.push({
+      prompt: "door opening sound with subtle room ambience shift",
+      start_seconds: 0.5,
+      duration_seconds: 2,
+      volume: 0.9,
+    });
+  }
+
+  if (!effects.length) {
+    effects.push({
+      prompt: "subtle cinematic ambient room tone with light movement",
+      start_seconds: 0,
+      duration_seconds: 3,
+      volume: 0.8,
+    });
+  }
+
+  return effects;
 }
 
 async function generateSoundEffectToFile({
@@ -401,10 +571,12 @@ async function buildSceneDialogueTrack({
   for (let i = 0; i < usableLines.length; i++) {
     const line = usableLines[i];
     const speechPath = path.join(tmpDir, `scene-${sceneIndex}-dialogue-${i}.mp3`);
+    const speaker = line.speaker || `Speaker ${i + 1}`;
+    const voice = line.voice || selectVoiceForSpeaker(speaker);
 
     await synthesizeSpeechToFile({
       text: line.text || "",
-      voice: line.voice || "alloy",
+      voice,
       outputPath: speechPath,
     });
 
@@ -448,13 +620,30 @@ async function buildSceneSfxTrack({
   sceneIndex,
   tmpDir,
 }) {
-  const effects = Array.isArray(scene?.sound_effects) ? scene.sound_effects : [];
+  const savedEffects = Array.isArray(scene?.sound_effects) ? scene.sound_effects : [];
+  const autoEffects = savedEffects.length
+    ? []
+    : await generateUniversalSoundPlan(scene);
+
+  const effects = savedEffects.length
+    ? savedEffects
+    : autoEffects.length
+    ? autoEffects
+    : buildSimpleFallbackSoundEffects(scene);
+
+  console.log(
+    `Scene ${sceneIndex} using ${savedEffects.length ? "saved" : autoEffects.length ? "auto-generated" : "fallback"} sound effects:`,
+    JSON.stringify(effects, null, 2)
+  );
+  console.log("ELEVENLABS KEY EXISTS:", !!ELEVENLABS_API_KEY);
+
   const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
 
   const silentBase = path.join(tmpDir, `scene-${sceneIndex}-sfx-base.m4a`);
   await createSilentAudio(silentBase, durationSeconds);
 
   if (!effects.length) {
+    console.log(`No usable sound effects for scene ${sceneIndex}`);
     return silentBase;
   }
 
@@ -473,6 +662,8 @@ async function buildSceneSfxTrack({
         `scene-${sceneIndex}-generated-sfx-${i}.mp3`
       );
 
+      console.log(`Generating SFX for scene ${sceneIndex}, effect ${i}:`, fx.prompt);
+
       await generateSoundEffectToFile({
         prompt: fx.prompt,
         outputPath: generatedPath,
@@ -482,23 +673,22 @@ async function buildSceneSfxTrack({
         ),
       });
 
+      console.log(`Generated SFX path: ${generatedPath}`);
+      console.log(`Generated SFX exists:`, fs.existsSync(generatedPath));
+      if (fs.existsSync(generatedPath)) {
+        console.log(`Generated SFX bytes:`, fs.statSync(generatedPath).size);
+      }
+
       usableEffects.push({
         ...fx,
         resolvedPath: generatedPath,
       });
       continue;
     }
-
-    const resolvedPath = resolveSfxPath(fx.type);
-    if (resolvedPath && fs.existsSync(resolvedPath)) {
-      usableEffects.push({
-        ...fx,
-        resolvedPath,
-      });
-    }
   }
 
   if (!usableEffects.length) {
+    console.log(`No usable sound effects for scene ${sceneIndex}`);
     return silentBase;
   }
 
@@ -514,7 +704,7 @@ async function buildSceneSfxTrack({
       0,
       Math.floor((Number(fx.start_seconds) || 0) * 1000)
     );
-    const volume = Number(fx.volume ?? 0.35);
+    const volume = Number(fx.volume ?? 1);
 
     filterParts.push(
       `[${i + 1}:a]adelay=${delayMs}|${delayMs},volume=${volume}[a${i + 1}]`
@@ -539,6 +729,11 @@ async function buildSceneSfxTrack({
     "aac",
     outputPath,
   ]);
+
+  console.log(`Built mixed SFX track for scene ${sceneIndex}: ${outputPath}`);
+  if (fs.existsSync(outputPath)) {
+    console.log(`Mixed SFX bytes:`, fs.statSync(outputPath).size);
+  }
 
   return outputPath;
 }
@@ -636,7 +831,7 @@ async function buildFinalAudioTrack({
       "-i",
       narrationPath,
       "-filter_complex",
-      "[0:a]volume=1.0[scene];[1:a]volume=0.8[narr];[scene][narr]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
+      "[0:a]volume=1.0[scene];[1:a]volume=0.4[narr];[scene][narr]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
       "-map",
       "[aout]",
       "-c:a",
