@@ -5,6 +5,8 @@ import path from "path";
 import { spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
+import RunwayML from "@runwayml/sdk";
+import { fal } from "@fal-ai/client";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -14,23 +16,44 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const VIDEO_MODEL = process.env.OPENAI_VIDEO_MODEL || "sora-2";
-const VIDEO_SIZE = process.env.OPENAI_VIDEO_SIZE || "1280x720";
+const RUNWAYML_API_SECRET = process.env.RUNWAYML_API_SECRET || "";
+const FAL_KEY = process.env.FAL_KEY || "";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
+
 const DEFAULT_SCENE_SECONDS = Number(process.env.DEFAULT_SCENE_SECONDS || "4");
 const MAX_SCENES_PER_EXPORT = Number(process.env.MAX_SCENES_PER_EXPORT || "4");
-const VIDEO_POLL_INTERVAL_MS = Number(process.env.VIDEO_POLL_INTERVAL_MS || "5000");
-const VIDEO_POLL_TIMEOUT_MS = Number(process.env.VIDEO_POLL_TIMEOUT_MS || "900000");
+
+const RUNWAY_MODEL = process.env.RUNWAY_MODEL || "veo3.1";
+const RUNWAY_RATIO = process.env.RUNWAY_RATIO || "1280:720";
+
+const PIKA_ENDPOINT =
+  process.env.PIKA_ENDPOINT || "fal-ai/pika/v2.1/text-to-video";
+const PIKA_ASPECT_RATIO = process.env.PIKA_ASPECT_RATIO || "16:9";
+const PIKA_RESOLUTION = process.env.PIKA_RESOLUTION || "720p";
 
 const BACKGROUND_MUSIC_PATH = process.env.BACKGROUND_MUSIC_PATH || "";
 const BGM_VOLUME = Number(process.env.BGM_VOLUME || "0.12");
 const TRANSITION_DURATION = Number(process.env.TRANSITION_DURATION || "0.4");
 const ENABLE_SUBTITLES = String(process.env.ENABLE_SUBTITLES || "false") === "true";
 
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ENABLE_GENERATED_SFX =
   String(process.env.ENABLE_GENERATED_SFX || "true") === "true";
-const AUTO_GENERATE_SOUND_PLAN =
-  String(process.env.AUTO_GENERATE_SOUND_PLAN || "true") === "true";
+
+const PROVIDER_CONFIG = {
+  video: {
+    primary: "runway",
+    fallback: "pika",
+  },
+  voice: {
+    primary: "openai",
+    fallback: "elevenlabs",
+  },
+  sfx: {
+    primary: "elevenlabs",
+    fallback: "internal",
+  },
+};
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -42,8 +65,21 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
+if (!RUNWAYML_API_SECRET && !FAL_KEY) {
+  console.error("At least one video provider key is required: RUNWAYML_API_SECRET or FAL_KEY");
+  process.exit(1);
+}
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+const runway = RUNWAYML_API_SECRET
+  ? new RunwayML({ apiKey: RUNWAYML_API_SECRET })
+  : null;
+
+if (FAL_KEY) {
+  fal.config({ credentials: FAL_KEY });
+}
 
 function requireSecret(req, res) {
   if (!WORKER_SECRET) {
@@ -147,11 +183,11 @@ function toPositiveInt(value, fallback) {
 
 function normalizeVideoSeconds(value) {
   const n = Number(value);
-  if (n >= 20) return "20";
-  if (n >= 16) return "16";
-  if (n >= 12) return "12";
-  if (n >= 8) return "8";
-  return "4";
+  if (n >= 10) return 10;
+  if (n >= 8) return 8;
+  if (n >= 6) return 6;
+  if (n >= 4) return 4;
+  return 4;
 }
 
 function normalizeScenes(project) {
@@ -165,7 +201,7 @@ function normalizeScenes(project) {
         base_prompt:
           "A cinematic realistic video scene with strong visual continuity, consistent subject identity, consistent environment, consistent lighting, and realistic motion.",
         continuity_rules:
-          "Keep the same subject identity, same environment layout, same lighting, same color palette, and same overall style. Avoid sudden visual changes.",
+          "Continue naturally from the previous scene. Keep the same subjects, environment, lighting, style, and motion continuity unless explicitly changed.",
         duration_seconds: DEFAULT_SCENE_SECONDS,
         dialogue: [],
         sound_effects: [],
@@ -190,17 +226,13 @@ function normalizeScenes(project) {
         `A cinematic realistic video scene for ${scene?.title || `scene ${sceneIndex + 1}`}.`,
       continuity_rules:
         scene?.continuity_rules ||
-        "Keep the same subject identity, same environment layout, same lighting, same color palette, and same overall style. Avoid sudden visual changes.",
+        "Continue naturally from the previous scene. Keep the same subjects, environment, lighting, style, and motion continuity unless explicitly changed.",
       duration_seconds: toPositiveInt(
         scene?.duration_seconds,
         DEFAULT_SCENE_SECONDS
       ),
       dialogue: Array.isArray(scene?.dialogue) ? scene.dialogue : [],
       sound_effects: Array.isArray(scene?.sound_effects) ? scene.sound_effects : [],
-      reference_image_url:
-        typeof scene?.reference_image_url === "string"
-          ? scene.reference_image_url
-          : null,
     };
   });
 }
@@ -231,11 +263,10 @@ function buildSceneVideoPrompt(scene, sceneIndex, totalScenes) {
     : "";
 
   return [
-    "Create a cinematic AI video shot with synchronized native audio.",
-    "Audio and visuals must match as closely as possible.",
-    "If a visible character speaks, their lip movements and facial performance should match the spoken line.",
-    "If an on-screen action creates a sound, the timing of that sound should match the action.",
+    "Create a cinematic AI video shot.",
     "This should feel like a real video clip, not a slideshow, not a storyboard, and not a sequence of still images.",
+    "If a visible character speaks, their lip movements and facial performance should match the spoken line as closely as the model allows.",
+    "If an on-screen action creates a sound, the timing of that sound should feel aligned with the action.",
     "",
     `SCENE TITLE: ${scene.title || ""}`,
     `BASE SCENE: ${scene.base_prompt || ""}`,
@@ -251,18 +282,12 @@ function buildSceneVideoPrompt(scene, sceneIndex, totalScenes) {
     sfxText || "- natural ambient audio only",
     "",
     "Requirements:",
-    "- synced spoken dialogue when visible characters speak",
-    "- synced action sounds where applicable",
-    "- realistic ambience",
+    "- cinematic composition",
     "- coherent natural motion",
-    "- realistic camera behavior",
     "- stable subject identity",
     "- stable environment",
-    "- stable lighting and color palette",
-    "- cinematic composition",
-    "- no captions or text on screen",
-    "- no comic-book style",
-    "- no storyboard style",
+    "- stable lighting and palette",
+    "- no subtitles or on-screen text",
   ]
     .filter(Boolean)
     .join("\n");
@@ -311,27 +336,158 @@ function stableHash(str) {
   return hash;
 }
 
-function selectVoiceForSpeaker(speaker) {
+function selectOpenAIVoiceForSpeaker(speaker) {
   const voices = ["alloy", "echo", "fable", "nova", "onyx", "shimmer"];
   const index = stableHash(speaker || "default") % voices.length;
   return voices[index];
 }
 
-function getSceneAudioPolicy(scene) {
-  const hasVisibleDialogue =
-    Array.isArray(scene?.dialogue) &&
-    scene.dialogue.some(
-      (line) => typeof line?.text === "string" && line.text.trim()
-    );
-
-  if (hasVisibleDialogue) {
-    return "native_sync";
-  }
-
-  return "hybrid";
+function chooseVideoProvider() {
+  if (PROVIDER_CONFIG.video.primary === "runway" && runway) return "runway";
+  if (PROVIDER_CONFIG.video.primary === "pika" && FAL_KEY) return "pika";
+  if (PROVIDER_CONFIG.video.fallback === "runway" && runway) return "runway";
+  if (PROVIDER_CONFIG.video.fallback === "pika" && FAL_KEY) return "pika";
+  throw new Error("No configured video provider is available");
 }
 
-async function synthesizeSpeechToFile({ text, voice = "alloy", outputPath }) {
+function chooseVoiceProvider() {
+  if (PROVIDER_CONFIG.voice.primary === "openai" && OPENAI_API_KEY) return "openai";
+  if (PROVIDER_CONFIG.voice.primary === "elevenlabs" && ELEVENLABS_API_KEY) return "elevenlabs";
+  if (PROVIDER_CONFIG.voice.fallback === "openai" && OPENAI_API_KEY) return "openai";
+  if (PROVIDER_CONFIG.voice.fallback === "elevenlabs" && ELEVENLABS_API_KEY) return "elevenlabs";
+  throw new Error("No configured voice provider is available");
+}
+
+function chooseSfxProvider() {
+  if (PROVIDER_CONFIG.sfx.primary === "elevenlabs" && ELEVENLABS_API_KEY) return "elevenlabs";
+  return "internal";
+}
+
+async function downloadToFile(url, outputPath) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to download file: ${res.status}`);
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
+}
+
+function extractRunwayVideoUrl(task) {
+  return (
+    task?.output?.[0] ||
+    task?.output?.video ||
+    task?.output?.video_url ||
+    task?.video_url ||
+    task?.url ||
+    null
+  );
+}
+
+async function generateSceneVideoWithRunway({ scene, sceneIndex, totalScenes, outputPath }) {
+  if (!runway) throw new Error("Runway provider not configured");
+
+  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
+  const duration = Math.max(2, Math.min(10, normalizeVideoSeconds(scene.duration_seconds)));
+
+  const task = await runway.textToVideo
+    .create({
+      model: RUNWAY_MODEL,
+      promptText: prompt,
+      ratio: RUNWAY_RATIO,
+      duration,
+    })
+    .waitForTaskOutput();
+
+  const videoUrl = extractRunwayVideoUrl(task);
+  if (!videoUrl) {
+    throw new Error("Runway completed without a usable output URL");
+  }
+
+  await downloadToFile(videoUrl, outputPath);
+  return outputPath;
+}
+
+async function generateSceneVideoWithPika({ scene, sceneIndex, totalScenes, outputPath }) {
+  if (!FAL_KEY) throw new Error("Pika/Fal provider not configured");
+
+  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
+  const duration = Math.max(5, Math.min(10, Number(scene.duration_seconds) || 5));
+
+  const result = await fal.subscribe(PIKA_ENDPOINT, {
+    input: {
+      prompt,
+      aspect_ratio: PIKA_ASPECT_RATIO,
+      resolution: PIKA_RESOLUTION,
+      duration,
+    },
+    logs: true,
+  });
+
+  const videoUrl =
+    result?.data?.video?.url ||
+    result?.data?.videos?.[0]?.url ||
+    result?.video?.url ||
+    null;
+
+  if (!videoUrl) {
+    throw new Error("Pika completed without a usable output URL");
+  }
+
+  await downloadToFile(videoUrl, outputPath);
+  return outputPath;
+}
+
+async function generateSceneVideo({ scene, sceneIndex, totalScenes, outputPath }) {
+  const primary = chooseVideoProvider();
+  const fallback =
+    primary === "runway" ? "pika" : "runway";
+
+  try {
+    if (primary === "runway") {
+      return await generateSceneVideoWithRunway({
+        scene,
+        sceneIndex,
+        totalScenes,
+        outputPath,
+      });
+    }
+
+    return await generateSceneVideoWithPika({
+      scene,
+      sceneIndex,
+      totalScenes,
+      outputPath,
+    });
+  } catch (primaryErr) {
+    console.error(`Primary video provider ${primary} failed:`, primaryErr?.message || primaryErr);
+
+    if (fallback === "runway" && runway) {
+      return await generateSceneVideoWithRunway({
+        scene,
+        sceneIndex,
+        totalScenes,
+        outputPath,
+      });
+    }
+
+    if (fallback === "pika" && FAL_KEY) {
+      return await generateSceneVideoWithPika({
+        scene,
+        sceneIndex,
+        totalScenes,
+        outputPath,
+      });
+    }
+
+    throw primaryErr;
+  }
+}
+
+async function synthesizeSpeechOpenAIToFile({
+  text,
+  voice = "alloy",
+  outputPath,
+}) {
   const speech = await openai.audio.speech.create({
     model: "gpt-4o-mini-tts",
     voice,
@@ -340,6 +496,60 @@ async function synthesizeSpeechToFile({ text, voice = "alloy", outputPath }) {
 
   const buffer = Buffer.from(await speech.arrayBuffer());
   fs.writeFileSync(outputPath, buffer);
+}
+
+async function synthesizeSpeechElevenLabsToFile({
+  text,
+  outputPath,
+}) {
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+    throw new Error("ElevenLabs TTS requires ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID");
+  }
+
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_multilingual_v2",
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`ElevenLabs TTS failed: ${txt}`);
+  }
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
+}
+
+async function synthesizeSpeechToFile({ text, voice = "alloy", outputPath }) {
+  const primary = chooseVoiceProvider();
+  const fallback = primary === "openai" ? "elevenlabs" : "openai";
+
+  try {
+    if (primary === "openai") {
+      return await synthesizeSpeechOpenAIToFile({ text, voice, outputPath });
+    }
+
+    return await synthesizeSpeechElevenLabsToFile({ text, outputPath });
+  } catch (primaryErr) {
+    console.error(`Primary voice provider ${primary} failed:`, primaryErr?.message || primaryErr);
+
+    if (fallback === "openai") {
+      return await synthesizeSpeechOpenAIToFile({ text, voice, outputPath });
+    }
+
+    return await synthesizeSpeechElevenLabsToFile({ text, outputPath });
+  }
 }
 
 async function createSilentAudio(outputPath, durationSeconds) {
@@ -355,87 +565,6 @@ async function createSilentAudio(outputPath, durationSeconds) {
     "aac",
     outputPath,
   ]);
-}
-
-async function generateUniversalSoundPlan(scene) {
-  if (!AUTO_GENERATE_SOUND_PLAN) {
-    return [];
-  }
-
-  const prompt = [
-    "Create a compact sound design plan for one cinematic video scene.",
-    "Return JSON only.",
-    "Return an array of 1 to 3 sound effects.",
-    "Each sound effect must have:",
-    "- prompt",
-    "- start_seconds",
-    "- duration_seconds",
-    "- volume",
-    "The prompts should describe realistic cinematic sound effects or ambience.",
-    "Do not invent dialogue.",
-    "",
-    `Scene title: ${scene.title || ""}`,
-    `Scene base prompt: ${scene.base_prompt || ""}`,
-    `Scene narration: ${scene.narration || ""}`,
-    `Duration seconds: ${scene.duration_seconds || DEFAULT_SCENE_SECONDS}`,
-  ].join("\n");
-
-  try {
-    const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: prompt,
-      text: {
-        format: {
-          type: "json_schema",
-          name: "sound_plan",
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              sound_effects: {
-                type: "array",
-                maxItems: 3,
-                items: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    prompt: { type: "string" },
-                    start_seconds: { type: "number" },
-                    duration_seconds: { type: "number" },
-                    volume: { type: "number" },
-                  },
-                  required: [
-                    "prompt",
-                    "start_seconds",
-                    "duration_seconds",
-                    "volume",
-                  ],
-                },
-              },
-            },
-            required: ["sound_effects"],
-          },
-        },
-      },
-    });
-
-    const raw = response.output_text || "{}";
-    const parsed = JSON.parse(raw);
-    const effects = Array.isArray(parsed?.sound_effects) ? parsed.sound_effects : [];
-
-    return effects.map((fx) => ({
-      prompt: String(fx.prompt || "").trim(),
-      start_seconds: Math.max(0, Number(fx.start_seconds) || 0),
-      duration_seconds: Math.max(
-        1,
-        Math.min(8, Number(fx.duration_seconds) || 3)
-      ),
-      volume: Math.max(0.1, Math.min(1.2, Number(fx.volume) || 0.8)),
-    }));
-  } catch (err) {
-    console.error("Auto sound plan generation failed:", err?.message || err);
-    return [];
-  }
 }
 
 function buildSimpleFallbackSoundEffects(scene) {
@@ -489,28 +618,6 @@ function buildSimpleFallbackSoundEffects(scene) {
     });
   }
 
-  if (sceneText.includes("explosion") || sceneText.includes("blast")) {
-    effects.push({
-      prompt: "loud cinematic explosion with echo and debris",
-      start_seconds: 0,
-      duration_seconds: 3,
-      volume: 1,
-    });
-  }
-
-  if (
-    sceneText.includes("door") ||
-    sceneText.includes("open") ||
-    sceneText.includes("enter")
-  ) {
-    effects.push({
-      prompt: "door opening sound with subtle room ambience shift",
-      start_seconds: 0.5,
-      duration_seconds: 2,
-      volume: 0.9,
-    });
-  }
-
   if (!effects.length) {
     effects.push({
       prompt: "subtle cinematic ambient room tone with light movement",
@@ -528,8 +635,10 @@ async function generateSoundEffectToFile({
   outputPath,
   durationSeconds = 3,
 }) {
-  if (!ELEVENLABS_API_KEY) {
-    throw new Error("Missing ELEVENLABS_API_KEY");
+  const provider = chooseSfxProvider();
+
+  if (provider !== "elevenlabs") {
+    throw new Error("No external SFX provider configured");
   }
 
   const res = await fetch("https://api.elevenlabs.io/v1/sound-generation", {
@@ -566,17 +675,13 @@ async function buildSceneDialogueTrack({
   const silentBase = path.join(tmpDir, `scene-${sceneIndex}-dialogue-base.m4a`);
   await createSilentAudio(silentBase, durationSeconds);
 
-  if (!lines.length) {
-    return silentBase;
-  }
+  if (!lines.length) return silentBase;
 
   const usableLines = lines.filter(
     (line) => typeof line?.text === "string" && line.text.trim()
   );
 
-  if (!usableLines.length) {
-    return silentBase;
-  }
+  if (!usableLines.length) return silentBase;
 
   const inputArgs = ["-i", silentBase];
   const filterParts = ["[0:a]volume=1.0[a0]"];
@@ -586,13 +691,18 @@ async function buildSceneDialogueTrack({
     const line = usableLines[i];
     const speechPath = path.join(tmpDir, `scene-${sceneIndex}-dialogue-${i}.mp3`);
     const speaker = line.speaker || `Speaker ${i + 1}`;
-    const voice = line.voice || selectVoiceForSpeaker(speaker);
+    const voice = line.voice || selectOpenAIVoiceForSpeaker(speaker);
 
-    await synthesizeSpeechToFile({
-      text: line.text || "",
-      voice,
-      outputPath: speechPath,
-    });
+    try {
+      await synthesizeSpeechToFile({
+        text: line.text || "",
+        voice,
+        outputPath: speechPath,
+      });
+    } catch (err) {
+      console.error(`Skipping failed dialogue line ${i}:`, err?.message || err);
+      continue;
+    }
 
     inputArgs.push("-i", speechPath);
 
@@ -603,9 +713,13 @@ async function buildSceneDialogueTrack({
     const volume = Number(line.volume ?? 1);
 
     filterParts.push(
-      `[${i + 1}:a]adelay=${delayMs}|${delayMs},volume=${volume}[a${i + 1}]`
+      `[${mixInputs.length}:a]adelay=${delayMs}|${delayMs},volume=${volume}[a${mixInputs.length}]`
     );
-    mixInputs.push(`[a${i + 1}]`);
+    mixInputs.push(`[a${mixInputs.length}]`);
+  }
+
+  if (mixInputs.length === 1) {
+    return silentBase;
   }
 
   const outputPath = path.join(tmpDir, `scene-${sceneIndex}-dialogue-mixed.m4a`);
@@ -634,32 +748,16 @@ async function buildSceneSfxTrack({
   sceneIndex,
   tmpDir,
 }) {
-  const savedEffects = Array.isArray(scene?.sound_effects) ? scene.sound_effects : [];
-  const autoEffects = savedEffects.length
-    ? []
-    : await generateUniversalSoundPlan(scene);
-
-  const effects = savedEffects.length
-    ? savedEffects
-    : autoEffects.length
-    ? autoEffects
+  const effects = Array.isArray(scene?.sound_effects) && scene.sound_effects.length
+    ? scene.sound_effects
     : buildSimpleFallbackSoundEffects(scene);
-
-  console.log(
-    `Scene ${sceneIndex} using ${
-      savedEffects.length ? "saved" : autoEffects.length ? "auto-generated" : "fallback"
-    } sound effects:`,
-    JSON.stringify(effects, null, 2)
-  );
-  console.log("ELEVENLABS KEY EXISTS:", !!ELEVENLABS_API_KEY);
 
   const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
 
   const silentBase = path.join(tmpDir, `scene-${sceneIndex}-sfx-base.m4a`);
   await createSilentAudio(silentBase, durationSeconds);
 
-  if (!effects.length) {
-    console.log(`No usable sound effects for scene ${sceneIndex}`);
+  if (!effects.length || !ENABLE_GENERATED_SFX) {
     return silentBase;
   }
 
@@ -667,19 +765,14 @@ async function buildSceneSfxTrack({
 
   for (let i = 0; i < effects.length; i++) {
     const fx = effects[i];
+    if (!(typeof fx?.prompt === "string" && fx.prompt.trim())) continue;
 
-    if (
-      ENABLE_GENERATED_SFX &&
-      typeof fx?.prompt === "string" &&
-      fx.prompt.trim()
-    ) {
-      const generatedPath = path.join(
-        tmpDir,
-        `scene-${sceneIndex}-generated-sfx-${i}.mp3`
-      );
+    const generatedPath = path.join(
+      tmpDir,
+      `scene-${sceneIndex}-generated-sfx-${i}.mp3`
+    );
 
-      console.log(`Generating SFX for scene ${sceneIndex}, effect ${i}:`, fx.prompt);
-
+    try {
       await generateSoundEffectToFile({
         prompt: fx.prompt,
         outputPath: generatedPath,
@@ -689,21 +782,16 @@ async function buildSceneSfxTrack({
         ),
       });
 
-      console.log(`Generated SFX path: ${generatedPath}`);
-      console.log(`Generated SFX exists:`, fs.existsSync(generatedPath));
-      if (fs.existsSync(generatedPath)) {
-        console.log(`Generated SFX bytes:`, fs.statSync(generatedPath).size);
-      }
-
       usableEffects.push({
         ...fx,
         resolvedPath: generatedPath,
       });
+    } catch (err) {
+      console.error(`Skipping failed SFX ${i}:`, err?.message || err);
     }
   }
 
   if (!usableEffects.length) {
-    console.log(`No usable sound effects for scene ${sceneIndex}`);
     return silentBase;
   }
 
@@ -745,11 +833,6 @@ async function buildSceneSfxTrack({
     outputPath,
   ]);
 
-  console.log(`Built mixed SFX track for scene ${sceneIndex}: ${outputPath}`);
-  if (fs.existsSync(outputPath)) {
-    console.log(`Mixed SFX bytes:`, fs.statSync(outputPath).size);
-  }
-
   return outputPath;
 }
 
@@ -764,12 +847,10 @@ async function buildFinalAudioTrack({
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
     const durationSeconds = Number(scene?.duration_seconds || DEFAULT_SCENE_SECONDS);
-    const sceneAudioPolicy = getSceneAudioPolicy(scene);
 
-    const dialoguePath =
-      shouldGenerateDialogue(audioMode) && sceneAudioPolicy !== "native_sync"
-        ? await buildSceneDialogueTrack({ scene, sceneIndex: i, tmpDir })
-        : null;
+    const dialoguePath = shouldGenerateDialogue(audioMode)
+      ? await buildSceneDialogueTrack({ scene, sceneIndex: i, tmpDir })
+      : null;
 
     const sfxPath = await buildSceneSfxTrack({ scene, sceneIndex: i, tmpDir });
 
@@ -1121,63 +1202,6 @@ async function mergeVideoWithFinalAudio({
   ]);
 }
 
-async function waitForVideoCompletion(videoId) {
-  const startedAt = Date.now();
-  let current = await openai.videos.retrieve(videoId);
-
-  while (
-    current.status === "queued" ||
-    current.status === "in_progress" ||
-    current.status === "processing"
-  ) {
-    if (Date.now() - startedAt > VIDEO_POLL_TIMEOUT_MS) {
-      throw new Error(`Timed out waiting for video job ${videoId}`);
-    }
-
-    await sleep(VIDEO_POLL_INTERVAL_MS);
-    current = await openai.videos.retrieve(videoId);
-  }
-
-  if (current.status === "failed") {
-    const apiError = current.error?.message || "Unknown Sora video failure";
-    throw new Error(`Video generation failed for ${videoId}: ${apiError}`);
-  }
-
-  if (current.status !== "completed") {
-    throw new Error(
-      `Unexpected video status for ${videoId}: ${current.status || "unknown"}`
-    );
-  }
-
-  return current;
-}
-
-async function createSceneVideoClip({
-  scene,
-  sceneIndex,
-  totalScenes,
-  outputPath,
-}) {
-  const prompt = buildSceneVideoPrompt(scene, sceneIndex, totalScenes);
-
-  const videoJob = await openai.videos.create({
-    model: VIDEO_MODEL,
-    prompt,
-    seconds: normalizeVideoSeconds(
-      scene.duration_seconds || DEFAULT_SCENE_SECONDS
-    ),
-    size: VIDEO_SIZE,
-  });
-
-  const completed = await waitForVideoCompletion(videoJob.id);
-  const content = await openai.videos.downloadContent(completed.id);
-  const arrayBuffer = await content.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
-  fs.writeFileSync(outputPath, buffer);
-  return outputPath;
-}
-
 app.get("/", (_req, res) => {
   res.send("clippiant-worker ok");
 });
@@ -1190,7 +1214,6 @@ app.post("/render", async (req, res) => {
     return res.status(400).json({ error: "Missing exportId" });
   }
 
-  console.log("Received render request for exportId:", exportId);
   res.json({ ok: true });
 
   let tmpDir = null;
@@ -1246,22 +1269,18 @@ app.post("/render", async (req, res) => {
         stage: "generating_narration",
       });
 
-      console.log("Generating narration audio");
-
       narrationPath = path.join(tmpDir, "narration.mp3");
       const narrationText = getNarrationText(project, scenes);
 
-      const narration = await openai.audio.speech.create({
-        model: "gpt-4o-mini-tts",
-        voice: "alloy",
-        input: narrationText,
-      });
-
-      const audioBuffer = Buffer.from(await narration.arrayBuffer());
-      fs.writeFileSync(narrationPath, audioBuffer);
-
-      if (fs.existsSync(narrationPath)) {
-        console.log("Narration bytes:", fs.statSync(narrationPath).size);
+      try {
+        await synthesizeSpeechToFile({
+          text: narrationText,
+          voice: "alloy",
+          outputPath: narrationPath,
+        });
+      } catch (err) {
+        console.error("Narration failed, continuing without it:", err?.message || err);
+        narrationPath = null;
       }
     } else {
       await updateExport(exportId, {
@@ -1275,8 +1294,6 @@ app.post("/render", async (req, res) => {
       stage: "generating_scene_videos",
     });
 
-    console.log("Generating native AI video clips for scenes");
-
     const sceneClipPaths = [];
 
     for (let sceneIndex = 0; sceneIndex < scenes.length; sceneIndex++) {
@@ -1286,17 +1303,12 @@ app.post("/render", async (req, res) => {
         `scene-clip-${String(sceneIndex + 1).padStart(2, "0")}.mp4`
       );
 
-      console.log(`Generating video for scene ${sceneIndex + 1}/${scenes.length}`);
-
-      await createSceneVideoClip({
+      await generateSceneVideo({
         scene,
         sceneIndex,
         totalScenes: scenes.length,
         outputPath: sceneClipPath,
       });
-
-      const hasAudio = await checkIfVideoHasAudio(sceneClipPath);
-      console.log(`Scene ${sceneIndex + 1} has native audio:`, hasAudio);
 
       sceneClipPaths.push(sceneClipPath);
 
@@ -1310,8 +1322,6 @@ app.post("/render", async (req, res) => {
       progress: 70,
       stage: "merging_video",
     });
-
-    console.log("Merging scene clips with transitions");
 
     await mergeSceneClipsWithTransitions(
       sceneClipPaths,
@@ -1327,10 +1337,7 @@ app.post("/render", async (req, res) => {
         stage: "adding_subtitles",
       });
 
-      console.log("Writing subtitles");
       writeSceneSubtitles(subtitlesPath, scenes, TRANSITION_DURATION);
-
-      console.log("Burning subtitles");
       await applySubtitles(mergedScenesPath, subtitledVideoPath, subtitlesPath);
       videoForAudio = subtitledVideoPath;
     }
@@ -1340,7 +1347,6 @@ app.post("/render", async (req, res) => {
       stage: "building_audio",
     });
 
-    console.log("Building final audio");
     const builtAudioPath = await buildFinalAudioTrack({
       audioMode,
       narrationPath,
@@ -1350,18 +1356,10 @@ app.post("/render", async (req, res) => {
 
     fs.copyFileSync(builtAudioPath, finalAudioPath);
 
-    console.log("Final audio path:", finalAudioPath);
-    console.log("Final audio exists:", fs.existsSync(finalAudioPath));
-    if (fs.existsSync(finalAudioPath)) {
-      console.log("Final audio bytes:", fs.statSync(finalAudioPath).size);
-    }
-
     await updateExport(exportId, {
       progress: 92,
       stage: "adding_audio",
     });
-
-    console.log("Merging final audio with optional background music");
 
     await mergeVideoWithFinalAudio({
       videoPath: videoForAudio,
@@ -1375,8 +1373,6 @@ app.post("/render", async (req, res) => {
       progress: 96,
       stage: "uploading",
     });
-
-    console.log("Uploading final video");
 
     const fileBytes = fs.readFileSync(finalVideoPath);
     const storagePath = `${exportId}.mp4`;
@@ -1403,16 +1399,8 @@ app.post("/render", async (req, res) => {
       video_url: publicUrlData?.publicUrl || null,
       error: null,
     });
-
-    console.log("Render completed:", exportId);
   } catch (e) {
-    let message = e?.message || String(e);
-
-    if (message.includes("Billing hard limit has been reached")) {
-      message =
-        "OpenAI billing limit reached. Increase your API billing limit or use a funded API key.";
-    }
-
+    const message = e?.message || String(e);
     console.error("Render failed:", message);
 
     try {
